@@ -44,6 +44,7 @@ from poke_env.player.local_simulation import LocalSim, SimNode
 from difflib import get_close_matches
 from pokechamp.prompts import get_number_turns_faint, get_status_num_turns_fnt, state_translate, get_gimmick_motivation
 
+
 DEBUG=False
 
 class LLMPlayer(Player):
@@ -111,15 +112,15 @@ class LLMPlayer(Player):
                 model_name = backend.replace('ollama/', '')
                 print(f"Using Ollama with model: {model_name}")
                 self.llm = OllamaPlayer(model=model_name, device=device)
-            elif 'gpt' in backend and not backend.startswith('openai/'):
+            elif backend.startswith(('openai/', 'anthropic/', 'google/', 'meta/', 'mistral/', 'cohere/', 'perplexity/', 'deepseek/', 'microsoft/', 'nvidia/', 'huggingface/', 'together/', 'replicate/', 'fireworks/', 'localai/', 'vllm/', 'sagemaker/', 'vertex/', 'bedrock/', 'azure/', 'custom/')):
+                # OpenRouter supports hundreds of models from various providers
+                self.llm = OpenRouterPlayer(self.api_key)
+            elif 'gpt' in backend:
                 self.llm = GPTPlayer(self.api_key)
             elif 'llama' == backend:
                 self.llm = LLAMAPlayer(device=device)
             elif 'gemini' in backend:
                 self.llm = GeminiPlayer(self.api_key)
-            elif backend.startswith(('openai/', 'anthropic/', 'google/', 'meta/', 'mistral/', 'cohere/', 'perplexity/', 'deepseek/', 'microsoft/', 'nvidia/', 'huggingface/', 'together/', 'replicate/', 'fireworks/', 'localai/', 'vllm/', 'sagemaker/', 'vertex/', 'bedrock/', 'azure/', 'custom/')):
-                # OpenRouter supports hundreds of models from various providers
-                self.llm = OpenRouterPlayer(self.api_key)
             else:
                 raise NotImplementedError('LLM type not implemented:', backend)
         else:

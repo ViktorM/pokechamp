@@ -4,6 +4,7 @@ from tqdm import tqdm
 import argparse
 import os, sys
 
+
 # Add the current directory to Python path (since we're in project root)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
@@ -13,29 +14,32 @@ from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_ra
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--temperature", type=float, default=0.5)
+parser.add_argument("--reasoning_effort", type=str, default="medium", choices=["low", "medium", "high"],
+                    help="Reasoning effort for o3-mini model (low=faster, high=better quality)")
 parser.add_argument("--prompt_algo", default="minimax", choices=prompt_algos)
-parser.add_argument("--battle_format", default="gen9ou", choices=["gen8randombattle", "gen8ou", "gen9ou", "gen9randombattle"])
-parser.add_argument("--backend", type=str, default="gemini-2.5-flash", choices=[
-    # OpenAI models
-    "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
-    # Anthropic models
-    "anthropic/claude-3.5-sonnet", "anthropic/claude-3-opus", "anthropic/claude-3-haiku",
+parser.add_argument("--battle_format", default="gen9ou", choices=[
+    # PokéAgent Challenge formats
+    "gen1ou", "gen2ou", "gen3ou", "gen4ou", "gen9ou",
+    # VGC formats
+    "gen9vgc2024regg",
+    # Random battle formats
+    "gen8randombattle", "gen9randombattle",
+    # Other OU formats
+    "gen8ou"
+])
+parser.add_argument("--backend", type=str, default="openai/gpt-4o", choices=[
+    # OpenAI models (direct API) - Latest
+    "gpt-5-pro", "gpt-5", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
+    # OpenAI models (via OpenRouter) - Latest
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    # Anthropic models - Latest (Claude 4.5 and 4.1)
+    "anthropic/claude-4.5-sonnet", "anthropic/claude-4.5-haiku", "anthropic/claude-4.1-opus",
     # Google models
-    "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
+    "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
+    # xAI models - Grok-4 only (removed obsolete Grok-2)
+    "x-ai/grok-4", "xx-ai/grok-4-fast",
     # Meta models
-    "meta-llama/llama-3.1-70b-instruct", "meta-llama/llama-3.1-8b-instruct",
-    # Mistral models
-    "mistralai/mistral-7b-instruct", "mistralai/mixtral-8x7b-instruct",
-    # Cohere models
-    "cohere/command-r-plus", "cohere/command-r",
-    # Perplexity models
-    "perplexity/llama-3.1-sonar-small-128k", "perplexity/llama-3.1-sonar-large-128k",
-    # DeepSeek models
-    "deepseek-ai/deepseek-coder-33b-instruct", "deepseek-ai/deepseek-llm-67b-chat",
-    # Microsoft models
-    "microsoft/wizardlm-2-8x22b", "microsoft/phi-3-medium-128k-instruct",
-    # Ollama models
-    "ollama/gpt-oss:20b", "ollama/llama3.1:8b", "ollama/qwen2.5:32b", "ollama/gemma3:4b", "ollama/gemma3:27b",
+    "meta-llama/llama-4-maverick", "meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.1-70b-instruct",
     # Local models (via OpenRouter)
     "llama", 'None'
 ])

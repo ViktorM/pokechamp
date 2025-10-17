@@ -407,7 +407,7 @@ class AbstractBattle(ABC):
                 folder = str(self._save_replays)
 
             if not os.path.exists(folder):
-                os.mkdir(folder)
+                os.makedirs(folder, exist_ok=True)
 
             with open(
                 os.path.join(
