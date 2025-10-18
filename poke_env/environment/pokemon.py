@@ -899,9 +899,18 @@ class Pokemon:
             else:
                 print('Bayesian stats failed')
         
-        # Original implementation
+        # Original implementation - with error handling for missing Pokemon
         stat_types = ['hp', 'atk', 'def', 'spa', 'spd', 'spe']
         sets = self._sets
+        
+        # Check if this Pokemon exists in the sets data
+        if self.species.lower() not in sets:
+            # Fallback to default EVs and nature when Pokemon not in dataset
+            default_evs = [85, 85, 85, 85, 85, 85]  # Balanced spread
+            default_nature = 'Hardy'  # Neutral nature
+            print(f"Warning: {self.species} not in sets data, using defaults")
+            return default_evs, default_nature
+        
         if guess_type == 'most_likely':
             # most likely based on statistics
             set = sets[self.species.lower()]['spreads'][0]
@@ -1151,8 +1160,14 @@ class Pokemon:
     def calculate_stats(self, ivs=(31,) * 6, evs=(85,) * 6, battle_format='random'):
         nature = None
         if not 'random' in battle_format:
-            # brute force the iv/ev
-            evs, nature = self.guess_stats()
+            # Only guess stats for Gen9 (where we have sets data)
+            # For Gen1-8, use default balanced EVs
+            if 'gen9' in battle_format.lower():
+                evs, nature = self.guess_stats()
+            else:
+                # Use default balanced EVs for older gens
+                evs = [85, 85, 85, 85, 85, 85]
+                nature = 'Hardy'  # Neutral nature
         def common_pkmn_stat_calc(stat: int, iv: int, ev: int, level: int):
             return math.floor(((2 * stat + iv + math.floor(ev / 4)) * level) / 100)
 

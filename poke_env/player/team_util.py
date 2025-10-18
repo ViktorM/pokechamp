@@ -123,7 +123,8 @@ def get_llm_player(args,
                    PNUMBER1: str='', 
                    USERNAME: str='', 
                    PASSWORD: str='', 
-                   online: bool=False) -> Player:
+                   online: bool=False,
+                   log_level=None) -> Player:
     from pokechamp.llm_player import LLMPlayer
     from pokechamp.prompts import prompt_translate, state_translate2
     
@@ -135,22 +136,26 @@ def get_llm_player(args,
     if name == 'abyssal':
         return AbyssalPlayer(battle_format=battle_format,
                             account_configuration=AccountConfiguration(f'{USERNAME}{PNUMBER1}', PASSWORD),
-                            server_configuration=server_config
+                            server_configuration=server_config,
+                            log_level=log_level
                             )
     elif name == 'max_power':
         return MaxBasePowerPlayer(battle_format=battle_format,
                             account_configuration=AccountConfiguration(f'{USERNAME}{PNUMBER1}', PASSWORD),
-                            server_configuration=server_config
+                            server_configuration=server_config,
+                            log_level=log_level
                             )
     elif name == 'random':
         return RandomPlayer(battle_format=battle_format,
                             account_configuration=AccountConfiguration(f'{USERNAME}{PNUMBER1}', PASSWORD),
-                            server_configuration=server_config
+                            server_configuration=server_config,
+                            log_level=log_level
                             )
     elif name == 'one_step':
         return OneStepPlayer(battle_format=battle_format,
                             account_configuration=AccountConfiguration(f'{USERNAME}{PNUMBER1}', PASSWORD),
-                            server_configuration=server_config
+                            server_configuration=server_config,
+                            log_level=log_level
                             )
     elif 'pokellmon' in name:
         return LLMPlayer(battle_format=battle_format,
@@ -163,7 +168,8 @@ def get_llm_player(args,
                        server_configuration=server_config,
                        save_replays=args.log_dir,
                        device=device,
-                       llm_backend=llm_backend)
+                       llm_backend=llm_backend,
+                       log_level=log_level)
     elif 'pokechamp' in name:
         return LLMPlayer(battle_format=battle_format,
                        api_key=KEY,
@@ -179,7 +185,8 @@ def get_llm_player(args,
                     #    prompt_translate=prompt_translate,
                        prompt_translate=state_translate2,
                        device=device,
-                       llm_backend=llm_backend)
+                       llm_backend=llm_backend,
+                       log_level=log_level)
     else:
         # Try to find a custom bot in the bots folder
         custom_bot_class = get_custom_bot_class(name)

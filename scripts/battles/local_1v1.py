@@ -16,16 +16,16 @@ parser = argparse.ArgumentParser()
 # Player arguments
 parser.add_argument("--player_prompt_algo", default="io", choices=prompt_algos)
 parser.add_argument("--player_backend", type=str, default="openai/gpt-4o", choices=[
-    # OpenAI models (direct API) - Latest
-    "gpt-5-pro", "gpt-5", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
-    # OpenAI models (via OpenRouter) - Latest
-    "openai/gpt-5-pro", "openai/gpt-5", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
-    # Anthropic models - Latest (Claude 4.5 and 4.1)
-    "anthropic/claude-4.5-sonnet", "anthropic/claude-4.5-haiku", "anthropic/claude-4.1-opus",
+    # OpenAI models (direct API) - Complete GPT-5 family
+    "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
+    # OpenAI models (via OpenRouter) - Complete GPT-5 family
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    # Anthropic models - Correct OpenRouter naming: claude-{type}-{version}
+    "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
     "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
     # xAI models - Grok-4 only (removed obsolete Grok-2)
-    "x-ai/grok-4", "xx-ai/grok-4-fast",
+    "x-ai/grok-4", "x-ai/grok-4-fast",
     # Meta models
     "meta-llama/llama-4-maverick", "meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.1-70b-instruct",
     # Local models (via OpenRouter)
@@ -37,16 +37,16 @@ parser.add_argument("--player_device", type=int, default=0)
 # Opponent arguments
 parser.add_argument("--opponent_prompt_algo", default="io", choices=prompt_algos)
 parser.add_argument("--opponent_backend", type=str, default="openai/gpt-4o", choices=[
-    # OpenAI models (direct API) - Latest
-    "gpt-5-pro", "gpt-5", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
-    # OpenAI models (via OpenRouter) - Latest
-    "openai/gpt-5-pro", "openai/gpt-5", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
-    # Anthropic models - Latest (Claude 4.5 and 4.1)
-    "anthropic/claude-4.5-sonnet", "anthropic/claude-4.5-haiku", "anthropic/claude-4.1-opus",
+    # OpenAI models (direct API) - Complete GPT-5 family
+    "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
+    # OpenAI models (via OpenRouter) - Complete GPT-5 family
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    # Anthropic models - Correct OpenRouter naming: claude-{type}-{version}
+    "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
     "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
     # xAI models - Grok-4 only (removed obsolete Grok-2)
-    "x-ai/grok-4", "xx-ai/grok-4-fast",
+    "x-ai/grok-4", "x-ai/grok-4-fast",
     # Meta models
     "meta-llama/llama-4-maverick", "meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.1-70b-instruct",
     # Local models (via OpenRouter)
@@ -57,7 +57,7 @@ parser.add_argument("--opponent_device", type=int, default=0)
 
 # Shared arguments
 parser.add_argument("--temperature", type=float, default=0.3)
-parser.add_argument("--reasoning_effort", type=str, default="medium", choices=["low", "medium", "high"],
+parser.add_argument("--reasoning_effort", type=str, default="low", choices=["low", "medium", "high"],
                     help="Reasoning effort for o3-mini model (low=faster, high=better quality)")
 parser.add_argument("--battle_format", default="gen9ou", choices=[
     # PokéAgent Challenge formats
@@ -70,18 +70,25 @@ parser.add_argument("--battle_format", default="gen9ou", choices=[
     "gen8ou"
 ])
 parser.add_argument("--log_dir", type=str, default="./battle_log/one_vs_one")
-parser.add_argument("--N", type=int, default=25)
+parser.add_argument("--N", type=int, default=1)
+parser.add_argument("--verbose", action="store_true", help="Show detailed turn-by-turn battle information")
 
 args = parser.parse_args()
 
 async def main():
+    import logging
+    
+    # Set logging level based on verbose flag
+    log_level = logging.DEBUG if args.verbose else logging.WARNING
+    
     player = get_llm_player(args, 
                             args.player_backend, 
                             args.player_prompt_algo, 
                             args.player_name, 
                             device=args.player_device,
                             PNUMBER1=PNUMBER1,  # for name uniqueness locally
-                            battle_format=args.battle_format)
+                            battle_format=args.battle_format,
+                            log_level=log_level)
     
     opponent = get_llm_player(args, 
                             args.opponent_backend, 
@@ -89,7 +96,8 @@ async def main():
                             args.opponent_name, 
                             device=args.opponent_device,
                             PNUMBER1=PNUMBER1 + '2',  # for name uniqueness locally
-                            battle_format=args.battle_format)
+                            battle_format=args.battle_format,
+                            log_level=log_level)
 
     # Use old teamloader for player, modern for opponent
     player_teamloader = get_metamon_teams(args.battle_format, "competitive")
@@ -103,21 +111,56 @@ async def main():
         player.update_team(player_teamloader.yield_team())
         opponent.update_team(opponent_teamloader.yield_team())
 
-    # play against bot for five battles
+    # play against bot for battles
     N = args.N
     pbar = tqdm(total=N)
     for i in range(N):
+        # Store win counts before battle
+        player_wins_before = player.n_won_battles
+        opponent_wins_before = opponent.n_won_battles
+        
         x = np.random.randint(0, 100)
         if x > 50:
             await player.battle_against(opponent, n_battles=1)
         else:
             await opponent.battle_against(player, n_battles=1)
+            
+        # Determine who won this battle
+        if player.n_won_battles > player_wins_before:
+            winner = f"🏆 PLAYER ({args.player_name}_{args.player_backend}) WON"
+        elif opponent.n_won_battles > opponent_wins_before:
+            winner = f"🏆 OPPONENT ({args.opponent_name}_{args.opponent_backend}) WON"
+        else:
+            winner = "⚔️  Draw or error"
+        
+        print(f"\nBattle {i+1}: {winner}")
+        print(f"Player ({args.player_name}_{args.player_backend}): {player.n_won_battles}W-{player.n_lost_battles}L | Opponent ({args.opponent_name}_{args.opponent_backend}): {opponent.n_won_battles}W-{opponent.n_lost_battles}L")
+        
         if not 'random' in args.battle_format:
             player.update_team(player_teamloader.yield_team())
             opponent.update_team(opponent_teamloader.yield_team())
         pbar.set_description(f"{player.win_rate*100:.2f}%")
         pbar.update(1)
-    print(f'player winrate: {player.win_rate*100}')
+    
+    print(f'\n{"="*80}')
+    print(f'FINAL RESULTS - Algorithm + Model Comparison:')
+    print(f'{"="*80}')
+    print(f'PLAYER:   {args.player_name:12}_{args.player_backend:30} = {player.n_won_battles}W-{player.n_lost_battles}L ({player.win_rate*100:.1f}%)')
+    print(f'OPPONENT: {args.opponent_name:12}_{args.opponent_backend:30} = {opponent.n_won_battles}W-{opponent.n_lost_battles}L ({opponent.win_rate*100:.1f}%)')
+    print(f'{"="*80}')
+    
+    # Show winner
+    if player.win_rate > opponent.win_rate:
+        print(f'\n🏆 Winner: {args.player_name}_{args.player_backend}')
+    elif opponent.win_rate > player.win_rate:
+        print(f'\n🏆 Winner: {args.opponent_name}_{args.opponent_backend}')
+    else:
+        print(f'\n🤝 Tied matchup!')
+    
+    # Helpful reminder for pure model testing
+    if args.player_name != args.opponent_name:
+        print(f'\n💡 Note: Different algorithms used ({args.player_name} vs {args.opponent_name}).')
+        print(f'   For pure model comparison, use: --player_name {args.player_name} --opponent_name {args.player_name}')
 
 
 if __name__ == "__main__":

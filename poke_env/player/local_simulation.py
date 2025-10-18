@@ -628,7 +628,17 @@ class LocalSim():
                     possible_moves = [move[0] for move in self.pokemon_move_dict[species].values()]
         else:
             if species in self.pokemon_move_dict:
-                possible_moves = [move[0] for move in self.pokemon_move_dict[species].values()]
+                # Get all possible moves, then validate they exist in this generation
+                all_possible_moves = [move[0] for move in self.pokemon_move_dict[species].values()]
+                # Filter to only moves that exist in current generation
+                for move_name in all_possible_moves:
+                    try:
+                        # Try to create Move object - will fail if move doesn't exist in gen
+                        Move(move_name, self.gen.gen)
+                        possible_moves.append(move_name)
+                    except ValueError:
+                        # Move doesn't exist in this generation, skip it
+                        continue
                 # possible_moves = self.pokemon_move_dict[species].keys()
         
         if return_separate:

@@ -51,7 +51,7 @@ class LLMPlayer(Player):
     def __init__(self,
                  battle_format,
                  api_key="",
-                 backend="gpt-4-1106-preview",
+                 backend="gpt-4o",
                  temperature=1.0,
                  prompt_algo="io",
                  log_dir=None,
@@ -63,14 +63,16 @@ class LLMPlayer(Player):
                  _use_strat_prompt=False,
                  prompt_translate: Callable=state_translate,
                  device=0,
-                 llm_backend=None
+                 llm_backend=None,
+                 log_level=None
                  ):
 
         super().__init__(battle_format=battle_format,
                          team=team,
                          save_replays=save_replays,
                          account_configuration=account_configuration,
-                         server_configuration=server_configuration)
+                         server_configuration=server_configuration,
+                         log_level=log_level)
 
         self._reward_buffer: Dict[AbstractBattle, float] = {}
         self._battle_last_action : Dict[AbstractBattle, Dict] = {}
@@ -112,8 +114,8 @@ class LLMPlayer(Player):
                 model_name = backend.replace('ollama/', '')
                 print(f"Using Ollama with model: {model_name}")
                 self.llm = OllamaPlayer(model=model_name, device=device)
-            elif backend.startswith(('openai/', 'anthropic/', 'google/', 'meta/', 'mistral/', 'cohere/', 'perplexity/', 'deepseek/', 'microsoft/', 'nvidia/', 'huggingface/', 'together/', 'replicate/', 'fireworks/', 'localai/', 'vllm/', 'sagemaker/', 'vertex/', 'bedrock/', 'azure/', 'custom/')):
-                # OpenRouter supports hundreds of models from various providers
+            elif backend.startswith(('openai/', 'anthropic/', 'google/', 'meta/', 'mistral/', 'cohere/', 'perplexity/', 'deepseek/', 'microsoft/', 'nvidia/', 'huggingface/', 'together/', 'replicate/', 'fireworks/', 'localai/', 'vllm/', 'sagemaker/', 'vertex/', 'bedrock/', 'azure/', 'custom/', 'x-ai/', 'xai/')):
+                # OpenRouter supports hundreds of models from various providers including xAI
                 self.llm = OpenRouterPlayer(self.api_key)
             elif 'gpt' in backend:
                 self.llm = GPTPlayer(self.api_key)
