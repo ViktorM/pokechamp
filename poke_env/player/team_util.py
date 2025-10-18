@@ -76,12 +76,53 @@ def get_metamon_teams(battle_format: str, set_name: str) -> TeamSet:
         )
     return TeamSet(path, battle_format)
 
-def load_random_team(id=None):
-    if id == None:
-        team_id = randint(1, 14)
+def load_random_team(id=None, battle_format: str = 'gen9ou'):
+    """Load a random static team for the given battle format.
+
+    The previous implementation was hardcoded to gen9 OU teams, which caused
+    cross-generation issues (e.g., loading Gen9 teams in Gen1 formats).
+
+    This version is format-aware. It looks for files matching
+    poke_env/data/static/teams/{gen}ou*.txt. If none are available for the
+    requested format, it returns None so callers can decide how to handle it
+    (e.g., fail fast or use a different source).
+    """
+    import glob
+    # Extract generation prefix (e.g. gen1, gen2, gen9) from battle_format
+    gen_prefix = 'gen9'
+    try:
+        if battle_format.startswith('gen'):
+            # Keep only the leading token like gen1, gen2, gen9
+            gen_prefix = battle_format.split('ou')[0]
+            # Normalize to just the 'genX' part if present
+            gen_prefix = gen_prefix.split()[0].strip()
+            if '/' in gen_prefix:
+                gen_prefix = gen_prefix.split('/')[0]
+            if '-' in gen_prefix:
+                gen_prefix = gen_prefix.split('-')[0]
+            # Safety: ensure it starts with gen
+            if not gen_prefix.startswith('gen'):
+                gen_prefix = 'gen9'
+        else:
+            gen_prefix = 'gen9'
+    except Exception:
+        gen_prefix = 'gen9'
+
+    pattern = f"poke_env/data/static/teams/{gen_prefix}ou*.txt"
+    files = sorted(glob.glob(pattern))
+    if not files:
+        # No static teams for this format/gen available
+        return None
+
+    if id is None:
+        # Choose any available file uniformly at random
+        file_path = random.choice(files)
     else:
-        team_id = id
-    with open(f'poke_env/data/static/teams/gen9ou{team_id}.txt', 'r') as f:
+        # Map id to an index within available files (1-based id)
+        idx = max(1, int(id)) - 1
+        file_path = files[idx % len(files)]
+
+    with open(file_path, 'r') as f:
         team = f.read()
     return team
 

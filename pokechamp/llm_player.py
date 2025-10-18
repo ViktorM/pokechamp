@@ -292,7 +292,42 @@ class LLMPlayer(Player):
         cot_prompt = 'In fewer than 3 sentences, let\'s think step by step:'
         state_prompt_io = state_prompt + state_action_prompt + constraint_prompt_io + cot_prompt
 
+        # Stricter JSON handling with bounded retries and sanitization
+        def _parse_llm_json(s: str):
+            # Strip common wrappers/fences and trailing commas
+            s = s.strip()
+            if s.startswith('```'):
+                s = s.strip('`')
+                # Remove potential language hint like ```json
+                if s.startswith('json'):
+                    s = s[4:]
+            s = s.strip()
+            # Attempt direct parse
+            try:
+                return json.loads(s)
+            except Exception:
+                # Try to extract first JSON object
+                start = s.find('{')
+                end = s.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        return json.loads(s[start:end+1])
+                    except Exception:
+                        pass
+            raise ValueError('Invalid JSON from LLM')
+
+        # Per-move timeout start
+        start_time = time.time()
+
         for i in range(retries):
+            # Timeout fallback: choose deterministic damage move
+            if time.time() - start_time > 10:
+                print('LLM timeout, using damage calculator fallback')
+                move, _ = self.dmg_calc_move(battle)
+                if move is not None:
+                    return move
+                return self.choose_max_damage_move(battle)
+
             try:
                 llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                             user_prompt=state_prompt_io,
@@ -303,10 +338,9 @@ class LLMPlayer(Player):
                                             json_format=True,
                                             actions=actions)
 
-                # load when llm does heavylifting for parsing
                 if DEBUG:
                     print(f"Raw LLM output: {llm_output}")
-                llm_action_json = json.loads(llm_output)
+                llm_action_json = _parse_llm_json(llm_output)
                 if DEBUG:
                     print(f"Parsed JSON: {llm_action_json}")
                 next_action = None
@@ -382,7 +416,7 @@ class LLMPlayer(Player):
                 if next_action is not None:
                     break
             except Exception as e:
-                print(f'Exception: {e}', 'passed')
+                print(f'Exception (JSON/selection): {e}', 'passed')
                 continue
         if next_action is None:
             print('No action found. Choosing max damage move')

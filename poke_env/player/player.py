@@ -187,11 +187,18 @@ class Player(ABC):
                 new_team = self._teamloader.yield_team()
                 self.logger.info(f"Loaded new team from teamloader after rejection")
             else:
-                # Fallback to static teams if no teamloader
+                # Fallback to static teams if no teamloader - format aware
                 from poke_env.player.team_util import load_random_team
                 new_team_id = ((self._team_rejection_count - 1) % 13) + 1
-                new_team = load_random_team(new_team_id)
-                self.logger.info(f"Loaded static team #{new_team_id} after rejection")
+                new_team = load_random_team(new_team_id, battle_format=self._format)
+                if new_team is None:
+                    self.logger.warning(
+                        f"No static teams available for format {self._format}; cannot fallback"
+                    )
+                else:
+                    self.logger.info(
+                        f"Loaded static team #{new_team_id} for format {self._format} after rejection"
+                    )
             
             # Update the team
             if new_team:
