@@ -45,7 +45,7 @@ class TeamSet(Teambuilder):
         with open(file, "r") as f:
             team_data = f.read()
         team = self.parse_showdown_team(team_data)
-        print(team)
+        # print(team)  # Commented out to avoid interference
         for mon in team:
             if mon.species is not None:
                 mon.nickname = mon.species

@@ -1,8 +1,9 @@
 from openai import OpenAI
-from time import sleep
 from openai import RateLimitError
+from time import sleep
 import os
 import json
+
 
 class OpenRouterPlayer():
     def __init__(self, api_key=""):

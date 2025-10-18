@@ -10,6 +10,7 @@ from pokechamp.prompts import get_avail_actions, prompt_translate as pt
 from poke_env.ps_client.account_configuration import AccountConfiguration
 import ast
 
+
 def recursive_nick_removal(text, start=0):
     for i in range(start, len(text)):
         line = text[i]

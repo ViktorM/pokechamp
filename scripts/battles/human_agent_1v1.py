@@ -23,11 +23,11 @@ parser.add_argument("--backend", type=str, default="openai/gpt-4o", choices=[
     "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
     # OpenAI models (via OpenRouter) - Latest
     "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
-    # Anthropic models - Correct OpenRouter naming format
+    # Anthropic models
     "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
     "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
-    # xAI models - Grok-4 only (removed obsolete Grok-2)
+    # xAI models - Grok-4 only for now
     "x-ai/grok-4", "x-ai/grok-4-fast",
     # Meta models
     "meta-llama/llama-4-maverick", "meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.1-70b-instruct",

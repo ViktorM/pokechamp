@@ -891,6 +891,11 @@ class Pokemon:
             observed_moves: List of observed moves to improve Bayesian predictions
             battle: Battle context for team information
         """
+        # Check if this is Gen1 - use hardcoded sets for better accuracy
+        if battle and hasattr(battle, '_format') and 'gen1' in battle._format.lower():
+            from poke_env.data.static.gen1_common_sets import get_gen1_stats
+            return get_gen1_stats(self.species)
+        
         # Try Bayesian predictions first if requested or if we have context
         if guess_type == 'bayesian' or (observed_moves and battle):
             bayesian_result = self._get_bayesian_stats(observed_moves, battle)

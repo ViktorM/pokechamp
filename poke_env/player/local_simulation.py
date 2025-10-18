@@ -604,6 +604,26 @@ class LocalSim():
             for move_id, opponent_move in mon.moves.items():
                 opponent_moves.append(f'{opponent_move.id}')
 
+        # Try Gen1 hardcoded sets first for gen1ou
+        if 'gen1' in self.format.lower():
+            try:
+                from poke_env.data.static.gen1_common_sets import get_gen1_moves
+                # Get confirmed moves - extract just the move IDs
+                confirmed_moves = []
+                if mon.moves:
+                    for move_id, move_obj in mon.moves.items():
+                        confirmed_moves.append(move_obj.id)
+                # Get predicted moves based on Gen1 sets
+                predicted_all = get_gen1_moves(mon.species, confirmed_moves)
+                if predicted_all:
+                    if return_separate:
+                        # Separate confirmed from predicted
+                        predicted_only = [m for m in predicted_all if m not in confirmed_moves]
+                        return confirmed_moves, predicted_only
+                    return predicted_all[:4]  # Return top 4 moves
+            except:
+                pass  # Fall back to original method
+        
         # Try Bayesian predictions first for gen9ou - includes both confirmed and predicted moves
         bayesian_result = []
         if self.format == 'gen9ou':
