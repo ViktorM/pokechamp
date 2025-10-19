@@ -136,6 +136,16 @@ class LLMPlayer(Player):
         self.use_llm_value_function = True  # Use LLM for leaf node evaluation (vs fast heuristic)
         self.max_depth_for_llm_eval = 2  # Only use LLM evaluation for shallow depths to save time
 
+        # Metrics and KPIs
+        self._move_metrics = []  # per-move rows
+        self._metrics_file_initialized = False
+        self._llm_calls_per_turn = {}  # battle_tag -> {turn: count}
+        self._timeout_avoided = {}     # battle_tag -> count
+        self._timeouts = {}            # battle_tag -> count
+        self._last_action_label = {}   # battle_tag -> last action label for oscillation
+        self._oscillation = {}         # battle_tag -> count
+        self._progress_scores = {}     # battle_tag -> [scores]
+
     def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None) -> str:
         if llm is None:
             output, _ = self.llm.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions)
@@ -287,6 +297,115 @@ class LLMPlayer(Player):
                 return self.choose_max_damage_move(battle)
 
         
+    def _init_metrics_file(self):
+        if not self.log_dir:
+            return
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            path = os.path.join(self.log_dir, 'metrics.csv')
+            if not os.path.exists(path):
+                with open(path, 'w') as f:
+                    f.write('battle_tag,turn,backend,latency_ms,json_ok,'
+                            'fallback_reason,available_moves,available_switches,'
+                            'action_kind,action_label,max_tokens,tokens_prompt,tokens_completion,'
+                            'near_timeout,progress_score\n')
+            self._metrics_file_initialized = True
+        except Exception:
+            pass
+
+    def _record_metric(self, battle: Battle, start_time: float, json_ok: bool, fallback_reason: str, action_kind: str, action_label: str, max_tokens: int, tokens_prompt: int, tokens_completion: int, near_timeout: bool, progress_score: int):
+        latency_ms = int((max(0.0, time.time() - start_time)) * 1000)
+        avail_moves = len(battle.available_moves) if getattr(battle, 'available_moves', None) is not None else 0
+        avail_switches = len(battle.available_switches) if getattr(battle, 'available_switches', None) is not None else 0
+        row = [
+            getattr(battle, 'battle_tag', ''),
+            getattr(battle, 'turn', 0),
+            self.backend,
+            latency_ms,
+            int(bool(json_ok)),
+            fallback_reason,
+            avail_moves,
+            avail_switches,
+            action_kind,
+            action_label,
+            max_tokens,
+            tokens_prompt,
+            tokens_completion,
+            int(near_timeout),
+            progress_score,
+        ]
+        self._move_metrics.append(row)
+        if self.log_dir:
+            if not self._metrics_file_initialized:
+                self._init_metrics_file()
+            try:
+                with open(os.path.join(self.log_dir, 'metrics.csv'), 'a') as f:
+                    f.write(','.join(map(str, row)) + "\n")
+            except Exception:
+                pass
+
+    def _bump_llm_calls(self, battle: Battle):
+        bt = getattr(battle, 'battle_tag', '')
+        turn = getattr(battle, 'turn', 0)
+        self._llm_calls_per_turn.setdefault(bt, {})
+        self._llm_calls_per_turn[bt][turn] = self._llm_calls_per_turn[bt].get(turn, 0) + 1
+
+    def _record_action_label(self, battle: Battle, action_kind: str, action_label: str):
+        bt = getattr(battle, 'battle_tag', '')
+        last = self._last_action_label.get(bt)
+        if last is not None and last == (action_kind, action_label) and action_kind == 'switch':
+            self._oscillation[bt] = self._oscillation.get(bt, 0) + 1
+        self._last_action_label[bt] = (action_kind, action_label)
+
+    def _record_progress(self, battle: Battle):
+        try:
+            score = int(self._get_fast_heuristic_evaluation(battle))
+        except Exception:
+            score = 50
+        bt = getattr(battle, 'battle_tag', '')
+        self._progress_scores.setdefault(bt, []).append(score)
+        return score
+
+    def _record_timeout(self, battle: Battle, avoided: bool):
+        bt = getattr(battle, 'battle_tag', '')
+        if avoided:
+            self._timeout_avoided[bt] = self._timeout_avoided.get(bt, 0) + 1
+        else:
+            self._timeouts[bt] = self._timeouts.get(bt, 0) + 1
+
+    def _battle_finished_callback(self, battle: AbstractBattle):
+        # Aggregate KPIs per battle when finished
+        bt = getattr(battle, 'battle_tag', '')
+        moves = [r for r in self._move_metrics if r[0] == bt]
+        if not moves:
+            return
+        latencies = [r[3] for r in moves]
+        avg_ms = sum(latencies) / len(latencies)
+        llm_calls = sum(self._llm_calls_per_turn.get(bt, {}).values()) if bt in self._llm_calls_per_turn else 0
+        timeouts = self._timeouts.get(bt, 0)
+        avoided = self._timeout_avoided.get(bt, 0)
+        osc = self._oscillation.get(bt, 0)
+        prog = self._progress_scores.get(bt, [])
+        prog_trend = (prog[-1] - prog[0]) if len(prog) >= 2 else 0
+        belief_entropy_trend = ''  # placeholder
+        if self.log_dir:
+            try:
+                with open(os.path.join(self.log_dir, 'metrics_summary.csv'), 'a') as f:
+                    f.write(','.join(map(str, [
+                        bt,
+                        int(battle.won),
+                        len(moves),
+                        f"{avg_ms:.1f}",
+                        llm_calls,
+                        timeouts,
+                        avoided,
+                        osc,
+                        prog_trend,
+                        belief_entropy_trend,
+                    ])) + "\n")
+            except Exception:
+                pass
+
     def io(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None):
         next_action = None
         cot_prompt = 'In fewer than 3 sentences, let\'s think step by step:'
@@ -316,16 +435,29 @@ class LLMPlayer(Player):
                         pass
             raise ValueError('Invalid JSON from LLM')
 
-        # Per-move timeout start
+        # Per-move timeout start and accounting
         start_time = time.time()
+        near_timeout_threshold = 5.0
+        max_tokens = 300
+        prev_prompt_tokens = getattr(self.llm, 'prompt_tokens', 0)
+        prev_completion_tokens = getattr(self.llm, 'completion_tokens', 0)
 
         for i in range(retries):
+            self._bump_llm_calls(battle)
             # Timeout fallback: choose deterministic damage move
             if time.time() - start_time > 10:
                 print('LLM timeout, using damage calculator fallback')
                 move, _ = self.dmg_calc_move(battle)
                 if move is not None:
+                    progress_score = self._record_progress(battle)
+                    self._record_timeout(battle, avoided=False)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='timeout', action_kind='move', action_label=str(getattr(move, 'order', '')), max_tokens=max_tokens,
+                                        tokens_prompt=0, tokens_completion=0, near_timeout=True, progress_score=progress_score)
                     return move
+                progress_score = self._record_progress(battle)
+                self._record_timeout(battle, avoided=False)
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='timeout', action_kind='max_damage', action_label='', max_tokens=max_tokens,
+                                    tokens_prompt=0, tokens_completion=0, near_timeout=True, progress_score=progress_score)
                 return self.choose_max_damage_move(battle)
 
             try:
@@ -333,7 +465,7 @@ class LLMPlayer(Player):
                                             user_prompt=state_prompt_io,
                                             model=self.backend,
                                             temperature=self.temperature,
-                                            max_tokens=300,
+                                            max_tokens=max_tokens,
                                             # stop=["reason"],
                                             json_format=True,
                                             actions=actions)
@@ -414,6 +546,20 @@ class LLMPlayer(Player):
                 #                         }) + "\n")
                 
                 if next_action is not None:
+                    # tokens and near-timeout
+                    tp = getattr(self.llm, 'prompt_tokens', 0)
+                    tc = getattr(self.llm, 'completion_tokens', 0)
+                    d_prompt = max(0, tp - prev_prompt_tokens)
+                    d_comp = max(0, tc - prev_completion_tokens)
+                    near_timeout = (time.time() - start_time) > near_timeout_threshold
+                    if near_timeout:
+                        self._record_timeout(battle, avoided=True)
+                    action_kind = 'move' if ("move" in llm_action_json or "dynamax" in llm_action_json or "terastallize" in llm_action_json) else ('switch' if "switch" in llm_action_json else 'unknown')
+                    action_label = llm_action_json.get('move') or llm_action_json.get('switch') or llm_action_json.get('dynamax') or llm_action_json.get('terastallize') or ''
+                    self._record_action_label(battle, action_kind, str(action_label))
+                    progress_score = self._record_progress(battle)
+                    self._record_metric(battle, start_time, json_ok=True, fallback_reason='', action_kind=action_kind, action_label=str(action_label), max_tokens=max_tokens,
+                                        tokens_prompt=d_prompt, tokens_completion=d_comp, near_timeout=near_timeout, progress_score=progress_score)
                     break
             except Exception as e:
                 print(f'Exception (JSON/selection): {e}', 'passed')
@@ -426,6 +572,12 @@ class LLMPlayer(Player):
                 pass
             print()
             # raise ValueError('No valid move', battle.active_pokemon.fainted, len(battle.available_switches))
+            progress_score = self._record_progress(battle)
+            near_timeout = (time.time() - start_time) > near_timeout_threshold
+            if near_timeout:
+                self._record_timeout(battle, avoided=True)
+            self._record_metric(battle, start_time, json_ok=False, fallback_reason='no_valid_action', action_kind='max_damage', action_label='', max_tokens=max_tokens,
+                                tokens_prompt=0, tokens_completion=0, near_timeout=near_timeout, progress_score=progress_score)
             next_action = self.choose_max_damage_move(battle)
         return next_action
 

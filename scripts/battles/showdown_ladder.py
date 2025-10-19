@@ -15,7 +15,7 @@ from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_ra
 parser = argparse.ArgumentParser()
 parser.add_argument("--temperature", type=float, default=0.5)
 parser.add_argument("--reasoning_effort", type=str, default="medium", choices=["low", "medium", "high"],
-                    help="Reasoning effort for o3-mini model (low=faster, high=better quality)")
+                    help="Reasoning effort for gpt-5/o4-mini model (low=faster, high=better quality)")
 parser.add_argument("--prompt_algo", default="minimax", choices=prompt_algos)
 parser.add_argument("--battle_format", default="gen9ou", choices=[
     # PokéAgent Challenge formats
