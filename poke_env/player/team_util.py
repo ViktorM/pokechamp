@@ -241,7 +241,8 @@ def get_llm_player(args,
                        save_replays=args.log_dir,
                        device=device,
                        llm_backend=llm_backend,
-                       log_level=log_level)
+                       log_level=log_level,
+                       reasoning_effort=getattr(args, 'reasoning_effort', 'low'))
     elif 'pokechamp' in name:
         return LLMPlayer(battle_format=battle_format,
                        api_key=KEY,
@@ -258,7 +259,8 @@ def get_llm_player(args,
                        prompt_translate=state_translate2,
                        device=device,
                        llm_backend=llm_backend,
-                       log_level=log_level)
+                       log_level=log_level,
+                       reasoning_effort=getattr(args, 'reasoning_effort', 'low'))
     else:
         # Try to find a custom bot in the bots folder
         custom_bot_class = get_custom_bot_class(name)

@@ -13,7 +13,8 @@ prompt_algos = [
     "heuristic", 
     'max_power',
     'one_step',
-    'random'
+    'random',
+    'rank'  # New single-call rank-and-pick algorithm
     ]
 
 def get_available_bots():

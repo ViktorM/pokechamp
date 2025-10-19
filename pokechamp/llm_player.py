@@ -13,8 +13,9 @@ from poke_env.environment.double_battle import DoubleBattle
 from poke_env.environment.move_category import MoveCategory
 from poke_env.environment.pokemon import Pokemon
 from poke_env.environment.side_condition import SideCondition
+from poke_env.environment.status import Status
 from poke_env.player.player import Player, BattleOrder
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from poke_env.environment.move import Move
 import time
 import json
@@ -43,6 +44,7 @@ from pokechamp.minimax_optimizer import (
 from poke_env.player.local_simulation import LocalSim, SimNode
 from difflib import get_close_matches
 from pokechamp.prompts import get_number_turns_faint, get_status_num_turns_fnt, state_translate, get_gimmick_motivation
+from pokechamp.gen1_quirks import Gen1Quirks
 
 
 DEBUG=False
@@ -66,7 +68,8 @@ class LLMPlayer(Player):
                  llm_backend=None,
                  log_level=None,
                  move_time_limit_s: float = None,
-                 max_tokens: int = 300
+                 max_tokens: int = 300,
+                 reasoning_effort: str = "low"
                  ):
 
         super().__init__(battle_format=battle_format,
@@ -85,6 +88,7 @@ class LLMPlayer(Player):
         self.log_dir = log_dir
         self.api_key = api_key
         self.prompt_algo = prompt_algo
+        self.reasoning_effort = reasoning_effort
         self.gen = GenData.from_format(battle_format)
         self.genNum = self.gen.gen
         self.prompt_translate = prompt_translate
@@ -174,11 +178,17 @@ class LLMPlayer(Player):
             pass
         return None
 
-    def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None) -> str:
-        if llm is None:
-            output, _ = self.llm.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions)
+    def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None, reasoning_effort=None) -> str:
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
+        
+        # Only pass reasoning_effort to GPTPlayer (supports it for o3-mini, o4-mini, gpt-5 models)
+        llm_to_use = llm if llm is not None else self.llm
+        if hasattr(llm_to_use, '__class__') and llm_to_use.__class__.__name__ == 'GPTPlayer':
+            output, _ = llm_to_use.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions, reasoning_effort=reasoning_effort)
         else:
-            output, _ = llm.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions)
+            # For OpenRouterPlayer, GeminiPlayer, etc. - don't pass reasoning_effort
+            output, _ = llm_to_use.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions)
         return output
     
     def check_all_pokemon(self, pokemon_str: str) -> Pokemon:
@@ -263,6 +273,15 @@ class LLMPlayer(Player):
             print(f"Pokemon {battle.active_pokemon.species} is trapped and cannot move or switch")
             return self.choose_default_move()
         
+        # Gen1 anti-wrap switch recommendation (only if not trapped)
+        if sim.gen.gen == 1 and not battle.trapped and len(battle.available_switches) > 0:
+            switch_target = Gen1Quirks.get_switch_recommendation(battle)
+            if switch_target:
+                for pokemon in battle.available_switches:
+                    if pokemon.species.lower() == switch_target.lower():
+                        print(f"Gen1 anti-wrap: switching to {pokemon.species}")
+                        return self.create_order(pokemon)
+        
         # HACK/TEMPORARY: Gen1 Anti-Wrap Strategy - DISABLED due to repeated crashes
         # This hack was causing TypeErrors when stats were None
         # The minimax/io should handle wrap strategy through proper evaluation
@@ -342,6 +361,10 @@ class LLMPlayer(Player):
                                     progress_score=progress_score)
                 return self.choose_max_damage_move(battle)
 
+        # Single-call rank-and-pick
+        elif self.prompt_algo == "rank":
+            return self.rank_and_pick(retries, system_prompt, state_prompt, state_action_prompt, battle, sim, actions=actions)
+        
         # Tree of thought, k = 3
         elif self.prompt_algo == "tot":
             llm_output1 = ""
@@ -730,6 +753,267 @@ class LLMPlayer(Player):
             next_action = self.choose_max_damage_move(battle)
         return next_action
 
+    def _extract_json_obj(self, s: str) -> Optional[Dict[str, Any]]:
+        """Be tolerant: find first '{' and last '}' and parse that slice."""
+        try:
+            i = s.find("{")
+            j = s.rfind("}")
+            if i == -1 or j == -1 or j <= i:
+                return None
+            return json.loads(s[i:j+1])
+        except Exception:
+            return None
+
+    def _compute_state_hash(self, battle: AbstractBattle) -> str:
+        """Compute a hash of the current battle state."""
+        # Simple version - could be more sophisticated
+        return f"{battle.battle_tag}-{battle.turn}-{hash(str(battle.active_pokemon.species))%10000:04x}"
+
+    def _get_progress_score(self, battle: AbstractBattle) -> Dict[str, float]:
+        """Get current progress metrics."""
+        # TODO: Implement proper PP advantage, status advantage, chip damage tracking
+        return {
+            "pp_adv": 0.0,  # Placeholder
+            "status_adv": 1.0 if battle.opponent_active_pokemon.status else 0.0,
+            "net_chip_last3": 0.0  # Placeholder
+        }
+
+    def _prune_candidates(self, battle: AbstractBattle, actions: List[Dict], pre_scores: Dict[str, float], max_actions: int = 4) -> List[Dict]:
+        """Smart pruning to keep diverse action types."""
+        # Separate moves and switches
+        moves = [(a, float(pre_scores.get(str(a["id"]), 0.0))) for a in actions if a["type"] in ["move", "dynamax", "terastallize"]]
+        switches = [(a, float(pre_scores.get(str(a["id"]), 0.0))) for a in actions if a["type"] == "switch"]
+        
+        # Sort by score
+        moves.sort(key=lambda x: x[1], reverse=True)
+        switches.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take top moves and best switch
+        pruned = [a for a, _ in moves[:max_actions-1]]
+        if switches and len(pruned) < max_actions:
+            pruned.append(switches[0][0])
+        
+        return pruned[:max_actions]
+
+    def rank_and_pick(self, retries, system_prompt, state_prompt, state_action_prompt, battle, sim, actions=None):
+        """Single-call rank-and-pick: LLM scores all actions in one call."""
+        start_time = time.time()
+        
+        # Get available actions with indices
+        legal_actions = []
+        action_map = {}  # id -> BattleOrder
+        idx = 0
+        
+        # Add moves with PP info
+        for move in battle.available_moves:
+            legal_actions.append({
+                "id": idx,
+                "type": "move",
+                "move": move.id,
+                "pp": move.current_pp if hasattr(move, 'current_pp') else None
+            })
+            action_map[idx] = self.create_order(move)
+            idx += 1
+        
+        # Add switches
+        for pokemon in battle.available_switches:
+            legal_actions.append({
+                "id": idx,
+                "type": "switch",
+                "to": pokemon.species
+            })
+            action_map[idx] = self.create_order(pokemon)
+            idx += 1
+        
+        # Gimmicks (dynamax, tera, etc.)
+        if battle.can_dynamax:
+            for move in battle.available_moves:
+                legal_actions.append({
+                    "id": idx,
+                    "type": "dynamax",
+                    "move": move.id
+                })
+                action_map[idx] = self.create_order(move, dynamax=True)
+                idx += 1
+        
+        if battle.can_tera:
+            for move in battle.available_moves:
+                legal_actions.append({
+                    "id": idx,
+                    "type": "terastallize",
+                    "move": move.id
+                })
+                action_map[idx] = self.create_order(move, terastallize=True)
+                idx += 1
+        
+        # If no legal actions, return default
+        if not legal_actions:
+            return self.choose_default_move()
+        
+        # Calculate pre-scores using damage calculator for moves
+        pre_scores = {}
+        for action in legal_actions:
+            if action["type"] in ["move", "dynamax", "terastallize"]:
+                # Quick damage estimate
+                move_name = action["move"]
+                try:
+                    move = Move(move_name, gen=sim.gen.gen)
+                    if move.category != MoveCategory.STATUS:
+                        # Use turns to faint as inverse pre-score
+                        turns = get_number_turns_faint(battle.active_pokemon, move, battle.opponent_active_pokemon, 
+                                                     sim, boosts1=battle.active_pokemon._boosts.copy(), 
+                                                     boosts2=battle.opponent_active_pokemon._boosts.copy())
+                        # Convert turns to score (1 turn = 1.0, 2 turns = 0.5, etc.)
+                        pre_score = min(1.0, 1.0 / max(1, turns))
+                    else:
+                        pre_score = 0.3  # Status moves get moderate score
+                    
+                    # Apply Gen1 quirks if applicable
+                    if sim.gen.gen == 1:
+                        pre_score = Gen1Quirks.adjust_move_value(
+                            move, battle.active_pokemon, battle.opponent_active_pokemon,
+                            battle, pre_score
+                        )
+                except:
+                    pre_score = 0.2
+                pre_scores[str(action["id"])] = round(pre_score, 2)
+            else:
+                # Switches get lower pre-score
+                pre_scores[str(action["id"])] = 0.15
+        
+        # Prune to top candidates
+        pruned_actions = self._prune_candidates(battle, legal_actions, pre_scores, max_actions=4)
+        pruned_map = {a["id"]: action_map[a["id"]] for a in pruned_actions}
+        
+        # Build battle context
+        state_hash = self._compute_state_hash(battle)
+        
+        # Check sleep/freeze clause status
+        sleep_count = sum(1 for mon in battle.opponent_team.values() 
+                         if mon.status == Status.SLP and not mon.fainted)
+        freeze_count = sum(1 for mon in battle.opponent_team.values() 
+                          if mon.status == Status.FRZ and not mon.fainted)
+        
+        # Filter pre-scores to only pruned actions
+        pruned_pre_scores = {str(a["id"]): pre_scores.get(str(a["id"]), 0.0) for a in pruned_actions}
+        
+        # Build ranking prompt with scores
+        constraint_prompt_rank = f'''You are a ranking function for Pokemon battles.
+Return ONLY a compact JSON with fields: state_hash, scores, pick.
+Do not include text before or after JSON.
+
+Current state_hash: {state_hash}
+Legal actions: {json.dumps(pruned_actions, separators=(",", ":"))}
+Pre-computed scores: {json.dumps(pruned_pre_scores, separators=(",", ":"))}
+
+Output format:
+{{"state_hash": "{state_hash}", "scores": {{"0": 0.45, "1": 0.52, ...}}, "pick": <best_id>}}
+
+Rules:
+- Scores must be floats in [0,1] representing win probability
+- "pick" must be the ID with highest score
+- Include scores for ALL provided action IDs
+'''
+        
+        state_prompt_rank = state_prompt + state_action_prompt + constraint_prompt_rank
+        
+        # Single LLM call
+        best_pick = None
+        for i in range(retries):
+            try:
+                llm_output = self.get_LLM_action(
+                    system_prompt=system_prompt,
+                    user_prompt=state_prompt_rank,
+                    model=self.backend,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    json_format=True,
+                    reasoning_effort=self.reasoning_effort
+                )
+                
+                # Extract JSON tolerantly
+                llm_json = self._extract_json_obj(llm_output)
+                if not llm_json:
+                    raise ValueError("No valid JSON found in response")
+                
+                # Validate response
+                scores = llm_json.get("scores", {})
+                pick = llm_json.get("pick")
+                
+                # Check state hash (optional)
+                if llm_json.get("state_hash") != state_hash:
+                    print(f"Warning: state hash mismatch, using pre-scores fallback")
+                    # Use pre-scores argmax from pruned actions
+                    pick = max(pruned_pre_scores.items(), key=lambda x: float(x[1]))[0]
+                    pick = int(pick)
+                
+                # Convert pick to int and validate
+                if pick is not None:
+                    pick = int(pick)
+                    if pick in pruned_map:
+                        best_pick = pick
+                        break
+                
+                # Fallback to best scored action
+                if scores:
+                    valid_scores = {int(k): float(v) for k, v in scores.items() if int(k) in pruned_map}
+                    if valid_scores:
+                        best_pick = max(valid_scores.items(), key=lambda x: x[1])[0]
+                        break
+                
+            except Exception as e:
+                print(f"Rank attempt {i+1} failed: {e}")
+                if 'llm_output' in locals():
+                    print(f"LLM output was: {llm_output[:200]}...")
+                if i < retries - 1:
+                    continue
+        
+        # Use the pick if we got one
+        if best_pick is not None and best_pick in pruned_map:
+            # Record metrics
+            elapsed = time.time() - start_time
+            near_timeout = elapsed > (self.move_time_limit_s * 0.8)
+            if near_timeout:
+                self._record_timeout(battle, avoided=True)
+            
+            picked_action = next(a for a in pruned_actions if a["id"] == best_pick)
+            action_kind = picked_action["type"]
+            action_label = picked_action.get("move") or picked_action.get("to", "")
+            
+            progress_score = self._record_progress(battle)
+            self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
+                              action_kind=action_kind, action_label=action_label,
+                              max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0,
+                              near_timeout=near_timeout, progress_score=progress_score)
+            
+            return pruned_map[best_pick]
+        
+        # Fallback to pre-scores argmax
+        if pruned_pre_scores:
+            best_id = int(max(pruned_pre_scores.items(), key=lambda x: float(x[1]))[0])
+            if best_id in pruned_map:
+                print("Using pre-scores argmax fallback")
+                return pruned_map[best_id]
+        
+        # Final fallback to damage calculator
+        print("Rank algorithm failed after all retries, using damage calculator fallback")
+        move, _ = self.dmg_calc_move(battle)
+        if move is not None:
+            progress_score = self._record_progress(battle)
+            self._record_metric(battle, start_time, json_ok=False, fallback_reason='rank_failed_dmgcalc',
+                              action_kind='move', action_label=str(getattr(move, 'order', '')),
+                              max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0,
+                              near_timeout=False, progress_score=progress_score)
+            return move
+        
+        # Last resort
+        progress_score = self._record_progress(battle)
+        self._record_metric(battle, start_time, json_ok=False, fallback_reason='rank_failed_maxdmg',
+                          action_kind='max_damage', action_label='', max_tokens=self.max_tokens,
+                          tokens_prompt=0, tokens_completion=0, near_timeout=False,
+                          progress_score=progress_score)
+        return self.choose_max_damage_move(battle)
+
     def sc(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim):
         # Track timeout for SC algorithm
         start_time = time.time()
@@ -813,6 +1097,16 @@ class LLMPlayer(Player):
                 t = get_status_num_turns_fnt(mon, move, mon_opp, sim, boosts=mon._boosts.copy())
             else:
                 t = get_number_turns_faint(mon, move, mon_opp, sim, boosts1=mon._boosts.copy(), boosts2=mon_opp.boosts.copy())
+            
+            # Apply Gen1 quirks to evaluation
+            if sim.gen.gen == 1 and not is_opp:
+                # Convert turns to value (inverse relationship)
+                move_value = 1.0 / max(1, t)
+                # Apply quirks
+                move_value = Gen1Quirks.adjust_move_value(move, mon, mon_opp, battle, move_value)
+                # Convert back to effective turns (lower is better)
+                t = 1.0 / max(0.01, move_value)
+            
             hp_remaining.append(t)
             # _, hp2, _, _ = sim.calculate_remaining_hp(battle.active_pokemon, battle.opponent_active_pokemon, move, None)
             # hp_remaining.append(hp2)

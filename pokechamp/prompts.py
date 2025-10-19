@@ -1175,6 +1175,7 @@ def state_translate(sim: LocalSim,
 
             gen1_rules = []
             gen1_rules.append("Gen1 Rules: Sleep Clause (only one opposing Pokémon may be put to sleep by you at a time), Freeze Clause (only one opposing Pokémon may be frozen). No items, no abilities, no team preview.")
+            gen1_rules.append("Gen1 Mechanics: Hyper Beam has no recharge if it KOs. Freeze = permanent KO (no thaw moves). Wrap/Bind/Fire Spin prevent ALL opponent actions while active. High-crit moves (Slash, Crabhammer, Razor Leaf) have ~25% crit rate.")
             if our_pp_str:
                 gen1_rules.append(f"Your move PP: {our_pp_str}")
             if revealed_opp_str:

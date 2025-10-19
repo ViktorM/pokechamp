@@ -707,6 +707,10 @@ class Player(ABC):
                     "[Invalid choice] Can't move: "
                 ) and split_message[2].endswith("can't Terastallize."):
                     await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2] == "[Invalid choice] There's nothing to choose":
+                    # This happens when trapped by wrap/etc and no actions available
+                    # The server expects no input during wait states
+                    pass
                 else:
                     self.logger.critical("Unexpected error message: %s", split_message)
             elif split_message[1] == "turn":
@@ -733,6 +737,11 @@ class Player(ABC):
         #print("from_teampreview_request", from_teampreview_request)
         #print("battle.teampreview", battle.teampreview)
         #print("battle.in_team_preview", battle.in_team_preview)
+        
+        # Check if we're in a wait state (e.g., trapped by wrap with no actions)
+        if battle.wait:
+            # Don't send anything - the server expects no input
+            return
 
         if maybe_default_order and random.random() < self.DEFAULT_CHOICE_CHANCE:
             message = self.choose_default_move().message

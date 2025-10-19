@@ -898,6 +898,11 @@ class AbstractBattle(ABC):
                 mon.end_turn()
 
     @property
+    def wait(self) -> bool:
+        """Whether the battle is in a wait state (no action required)."""
+        return self._wait if self._wait is not None else False
+
+    @property
     @abstractmethod
     def active_pokemon(self) -> Pokemon:
         pass
