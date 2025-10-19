@@ -19,11 +19,11 @@ parser.add_argument("--player_backend", type=str, default="openai/gpt-4o", choic
     # OpenAI models (direct API)
     "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
     # OpenAI models (via OpenRouter)
-    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
     # Anthropic models
     "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
-    "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
+    "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-2.5-flash-preview-09-2025", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
     # xAI models - Grok-4 only for now
     "x-ai/grok-4", "x-ai/grok-4-fast",
     # Meta models
@@ -40,11 +40,11 @@ parser.add_argument("--opponent_backend", type=str, default="openai/gpt-4o", cho
     # OpenAI models (direct API)
     "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
     # OpenAI models (via OpenRouter)
-    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
     # Anthropic models
     "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
-    "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
+    "gemini-2.5-flash", "gemini-2.5-pro", "google/gemini-2.5-flash-preview-09-2025", "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro",
     # xAI models - Grok-4 only for now
     "x-ai/grok-4", "x-ai/grok-4-fast",
     # Meta models
@@ -72,6 +72,10 @@ parser.add_argument("--battle_format", default="gen9ou", choices=[
 parser.add_argument("--log_dir", type=str, default="./battle_log/one_vs_one")
 parser.add_argument("--N", type=int, default=1)
 parser.add_argument("--verbose", action="store_true", help="Show detailed turn-by-turn battle information")
+parser.add_argument("--max_tokens", type=int, default=300, help="Max tokens for LLM replies (both players)")
+parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
+parser.add_argument("--player_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (player)")
+parser.add_argument("--opponent_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (opponent)")
 
 args = parser.parse_args()
 
@@ -81,23 +85,42 @@ async def main():
     # Set logging level based on verbose flag
     log_level = logging.DEBUG if args.verbose else logging.WARNING
     
+    # Create unique player IDs to avoid conflicts
+    import time
+    timestamp = str(int(time.time() * 100) % 10000)  # 4 digits max
+    
     player = get_llm_player(args, 
                             args.player_backend, 
                             args.player_prompt_algo, 
                             args.player_name, 
                             device=args.player_device,
-                            PNUMBER1=PNUMBER1,  # for name uniqueness locally
+                            PNUMBER1=PNUMBER1 + timestamp,  # for name uniqueness locally
                             battle_format=args.battle_format,
                             log_level=log_level)
+    # Apply local tuning knobs
+    try:
+        player.max_tokens = int(max(1, args.max_tokens))
+        if args.player_K is not None:
+            player.K = int(max(1, args.player_K))
+        player.move_time_limit_s = float(max(1.0, args.move_time_limit))
+    except Exception:
+        pass
     
     opponent = get_llm_player(args, 
                             args.opponent_backend, 
                             args.opponent_prompt_algo, 
                             args.opponent_name, 
                             device=args.opponent_device,
-                            PNUMBER1=PNUMBER1 + '2',  # for name uniqueness locally
+                            PNUMBER1=PNUMBER1 + str(int(timestamp) + 1),  # for name uniqueness locally
                             battle_format=args.battle_format,
                             log_level=log_level)
+    try:
+        opponent.max_tokens = int(max(1, args.max_tokens))
+        if args.opponent_K is not None:
+            opponent.K = int(max(1, args.opponent_K))
+        opponent.move_time_limit_s = float(max(1.0, args.move_time_limit))
+    except Exception:
+        pass
 
     # Use old teamloader for player, modern for opponent
     player_teamloader = get_metamon_teams(args.battle_format, "competitive")
@@ -127,14 +150,14 @@ async def main():
             
         # Determine who won this battle
         if player.n_won_battles > player_wins_before:
-            winner = f"🏆 PLAYER ({args.player_name}_{args.player_backend}) WON"
+            winner = f"🏆 PLAYER ({args.player_prompt_algo}_{args.player_name}_{args.player_backend}) WON"
         elif opponent.n_won_battles > opponent_wins_before:
-            winner = f"🏆 OPPONENT ({args.opponent_name}_{args.opponent_backend}) WON"
+            winner = f"🏆 OPPONENT ({args.opponent_prompt_algo}_{args.opponent_name}_{args.opponent_backend}) WON"
         else:
             winner = "⚔️  Draw or error"
         
         print(f"\nBattle {i+1}: {winner}")
-        print(f"Player ({args.player_name}_{args.player_backend}): {player.n_won_battles}W-{player.n_lost_battles}L | Opponent ({args.opponent_name}_{args.opponent_backend}): {opponent.n_won_battles}W-{opponent.n_lost_battles}L")
+        print(f"Player ({args.player_prompt_algo}_{args.player_name}_{args.player_backend}): {player.n_won_battles}W-{player.n_lost_battles}L | Opponent ({args.opponent_prompt_algo}_{args.opponent_name}_{args.opponent_backend}): {opponent.n_won_battles}W-{opponent.n_lost_battles}L")
         
         if not 'random' in args.battle_format:
             player.update_team(player_teamloader.yield_team())
@@ -145,15 +168,15 @@ async def main():
     print(f'\n{"="*80}')
     print(f'FINAL RESULTS - Algorithm + Model Comparison:')
     print(f'{"="*80}')
-    print(f'PLAYER:   {args.player_name:12}_{args.player_backend:30} = {player.n_won_battles}W-{player.n_lost_battles}L ({player.win_rate*100:.1f}%)')
-    print(f'OPPONENT: {args.opponent_name:12}_{args.opponent_backend:30} = {opponent.n_won_battles}W-{opponent.n_lost_battles}L ({opponent.win_rate*100:.1f}%)')
+    print(f'PLAYER:   {args.player_prompt_algo:8}_{args.player_name:12}_{args.player_backend:30} = {player.n_won_battles}W-{player.n_lost_battles}L ({player.win_rate*100:.1f}%)')
+    print(f'OPPONENT: {args.opponent_prompt_algo:8}_{args.opponent_name:12}_{args.opponent_backend:30} = {opponent.n_won_battles}W-{opponent.n_lost_battles}L ({opponent.win_rate*100:.1f}%)')
     print(f'{"="*80}')
     
     # Show winner
     if player.win_rate > opponent.win_rate:
-        print(f'\n🏆 Winner: {args.player_name}_{args.player_backend}')
+        print(f'\n🏆 Winner: {args.player_prompt_algo}_{args.player_name}_{args.player_backend}')
     elif opponent.win_rate > player.win_rate:
-        print(f'\n🏆 Winner: {args.opponent_name}_{args.opponent_backend}')
+        print(f'\n🏆 Winner: {args.opponent_prompt_algo}_{args.opponent_name}_{args.opponent_backend}')
     else:
         print(f'\n🤝 Tied matchup!')
     

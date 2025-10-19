@@ -59,12 +59,14 @@ class LLMPlayer(Player):
                  save_replays=None,
                  account_configuration=None,
                  server_configuration=None,
-                 K=2,
+                 K=3,
                  _use_strat_prompt=False,
                  prompt_translate: Callable=state_translate,
                  device=0,
                  llm_backend=None,
-                 log_level=None
+                 log_level=None,
+                 move_time_limit_s: float = None,
+                 max_tokens: int = 300
                  ):
 
         super().__init__(battle_format=battle_format,
@@ -135,6 +137,9 @@ class LLMPlayer(Player):
         self.use_damage_calc_early_exit = True  # Use damage calculator to exit early when advantageous
         self.use_llm_value_function = True  # Use LLM for leaf node evaluation (vs fast heuristic)
         self.max_depth_for_llm_eval = 2  # Only use LLM evaluation for shallow depths to save time
+        # Per-move time budget (seconds). Defaults to 8s if not provided
+        self.move_time_limit_s = move_time_limit_s if move_time_limit_s is not None else 8.0
+        self.max_tokens = int(max(1, max_tokens))
 
         # Metrics and KPIs
         self._move_metrics = []  # per-move rows
@@ -145,6 +150,29 @@ class LLMPlayer(Player):
         self._last_action_label = {}   # battle_tag -> last action label for oscillation
         self._oscillation = {}         # battle_tag -> count
         self._progress_scores = {}     # battle_tag -> [scores]
+        
+        # Partial trap state tracking (Gen1)
+        self._trap_states = {}  # battle_tag -> trap state dict
+
+    def _recover_action_from_text(self, raw_text: str, battle: Battle):
+        """Attempt to recover a legal action from non-JSON text.
+
+        Strategy: find a legal move id or switch species mentioned in the text.
+        Returns a BattleOrder or None.
+        """
+        try:
+            text = (raw_text or '').lower().replace(' ', '').replace('-', '')
+            for move in (battle.available_moves or []):
+                mid = move.id.lower().replace(' ', '').replace('-', '')
+                if mid and mid in text:
+                    return self.create_order(move)
+            for mon in (battle.available_switches or []):
+                sid = (mon.species or '').lower().replace(' ', '').replace('-', '')
+                if sid and sid in text:
+                    return self.create_order(mon)
+        except Exception:
+            pass
+        return None
 
     def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None) -> str:
         if llm is None:
@@ -166,6 +194,49 @@ class LLMPlayer(Player):
         pokemon = Pokemon(species=pokemon_str, gen=self.genNum)
         return pokemon
 
+    def _update_trap_state(self, battle: AbstractBattle):
+        """Update partial trap state based on battle conditions."""
+        battle_tag = battle.battle_tag if hasattr(battle, 'battle_tag') else str(battle)
+        
+        # Initialize if needed
+        if battle_tag not in self._trap_states:
+            self._trap_states[battle_tag] = {
+                'active': False,
+                'source': None,
+                'move': None,
+                'turns': 0
+            }
+        
+        trap_state = self._trap_states[battle_tag]
+        
+        # Check if we're trapped
+        if battle.trapped:
+            # We're currently trapped
+            if not trap_state['active']:
+                # Just got trapped
+                trap_state['active'] = True
+                trap_state['turns'] = 1
+                if battle.opponent_active_pokemon:
+                    trap_state['source'] = battle.opponent_active_pokemon.species
+                    # Try to identify the move from opponent's known moves
+                    trap_moves = ['wrap', 'bind', 'firespin', 'clamp']
+                    for move in battle.opponent_active_pokemon.moves.values():
+                        if move.id in trap_moves:
+                            trap_state['move'] = move.id
+                            break
+            else:
+                # Still trapped
+                trap_state['turns'] += 1
+        else:
+            # Not trapped - reset if we were
+            if trap_state['active']:
+                trap_state['active'] = False
+                trap_state['source'] = None
+                trap_state['move'] = None
+                trap_state['turns'] = 0
+                
+        return trap_state
+
     def choose_move(self, battle: AbstractBattle):
         sim = LocalSim(battle, 
                     self.move_effect,
@@ -183,6 +254,20 @@ class LLMPlayer(Player):
         if battle.turn <=1 and self.use_strat_prompt:
             self.strategy_prompt = sim.get_llm_system_prompt(self.format, self.llm, team_str=self.team_str, model='gpt-4o-2024-05-13')
         
+        # Update trap state
+        trap_state = self._update_trap_state(battle)
+        
+        # Handle trapped Pokemon (e.g., by Wrap in Gen 1) - no moves or switches available
+        if (battle.trapped or (len(battle.available_moves) == 0 and len(battle.available_switches) == 0)) and not battle.active_pokemon.fainted:
+            # Pokemon is trapped and cannot do anything - return default order
+            print(f"Pokemon {battle.active_pokemon.species} is trapped and cannot move or switch")
+            return self.choose_default_move()
+        
+        # HACK/TEMPORARY: Gen1 Anti-Wrap Strategy - DISABLED due to repeated crashes
+        # This hack was causing TypeErrors when stats were None
+        # The minimax/io should handle wrap strategy through proper evaluation
+        pass
+        
         if battle.active_pokemon:
             if battle.active_pokemon.fainted and len(battle.available_switches) == 1:
                 next_action = BattleOrder(battle.available_switches[0])
@@ -192,6 +277,9 @@ class LLMPlayer(Player):
         elif len(battle.available_moves) <= 1 and len(battle.available_switches) == 0:
             return self.choose_max_damage_move(battle)
 
+        # Pass trap state to the prompt generator
+        if hasattr(sim, 'set_trap_state'):
+            sim.set_trap_state(trap_state)
         system_prompt, state_prompt, state_action_prompt = sim.state_translate(battle) # add lower case
         moves = [move.id for move in battle.available_moves]
         switches = [pokemon.species for pokemon in battle.available_switches]
@@ -202,19 +290,19 @@ class LLMPlayer(Player):
         if 'pokellmon' not in self.ps_client.account_configuration.username: # make sure we dont mess with pokellmon original strat
             gimmick_output_format = f'{f' or {{"dynamax":"<move_name>"}}' if battle.can_dynamax else ''}{f' or {{"terastallize":"<move_name>"}}' if battle.can_tera else ''}'
 
-        if battle.active_pokemon.fainted or len(battle.available_moves) == 0:
-
-            constraint_prompt_io = '''Choose the most suitable pokemon to switch. Your output MUST be a JSON like: {"switch":"<switch_pokemon_name>"}\n'''
+        if battle.active_pokemon.fainted or (len(battle.available_moves) == 0 and len(battle.available_switches) > 0 and not battle.trapped):
+            # Pokemon is fainted or can't move but can switch (not trapped)
+            constraint_prompt_io = '''Choose the most suitable pokemon to switch. Pick exactly one action. Your output MUST be a JSON like: {"switch":"<switch_pokemon_name>", "why":"<=20 tokens (optional)"}. If low on budget, omit "why".\n'''
             constraint_prompt_cot = '''Choose the most suitable pokemon to switch by thinking step by step. Your thought should no more than 4 sentences. Your output MUST be a JSON like: {"thought":"<step-by-step-thinking>", "switch":"<switch_pokemon_name>"}\n'''
             constraint_prompt_tot_1 = '''Generate top-k (k<=3) best switch options. Your output MUST be a JSON like:{"option_1":{"action":"switch","target":"<switch_pokemon_name>"}, ..., "option_k":{"action":"switch","target":"<switch_pokemon_name>"}}\n'''
             constraint_prompt_tot_2 = '''Select the best option from the following choices by considering their consequences: [OPTIONS]. Your output MUST be a JSON like:{"decision":{"action":"switch","target":"<switch_pokemon_name>"}}\n'''
-        elif len(battle.available_switches) == 0:
-            constraint_prompt_io = f'''Choose the best action and your output MUST be a JSON like: {{"move":"<move_name>"}}{gimmick_output_format}\n'''
+        elif len(battle.available_switches) == 0 or battle.trapped:
+            constraint_prompt_io = f'''Choose the best action. Pick exactly one action. Your output MUST be a JSON like: {{"move":"<move_name>", "why":"<=20 tokens (optional)"}}{gimmick_output_format}. If low on budget, omit "why".\n'''
             constraint_prompt_cot = '''Choose the best action by thinking step by step. Your thought should no more than 4 sentences. Your output MUST be a JSON like: {"thought":"<step-by-step-thinking>", "move":"<move_name>"} or {"thought":"<step-by-step-thinking>"}\n'''
             constraint_prompt_tot_1 = '''Generate top-k (k<=3) best action options. Your output MUST be a JSON like: {"option_1":{"action":"<move>", "target":"<move_name>"}, ..., "option_k":{"action":"<move>", "target":"<move_name>"}}\n'''
             constraint_prompt_tot_2 = '''Select the best action from the following choices by considering their consequences: [OPTIONS]. Your output MUST be a JSON like:"decision":{"action":"<move>", "target":"<move_name>"}\n'''
         else:
-            constraint_prompt_io = f'''Choose the best action and your output MUST be a JSON like: {{"move":"<move_name>"}}{gimmick_output_format} or {{"switch":"<switch_pokemon_name>"}}\n'''
+            constraint_prompt_io = f'''Choose the best action. Pick exactly one action. Your output MUST be a JSON like: {{"move":"<move_name>", "why":"<=20 tokens (optional)"}}{gimmick_output_format} or {{"switch":"<switch_pokemon_name>", "why":"<=20 tokens (optional)"}}. If low on budget, omit "why".\n'''
             constraint_prompt_cot = '''Choose the best action by thinking step by step. Your thought should no more than 4 sentences. Your output MUST be a JSON like: {"thought":"<step-by-step-thinking>", "move":"<move_name>"} or {"thought":"<step-by-step-thinking>", "switch":"<switch_pokemon_name>"}\n'''
             constraint_prompt_tot_1 = '''Generate top-k (k<=3) best action options. Your output MUST be a JSON like: {"option_1":{"action":"<move_or_switch>", "target":"<move_name_or_switch_pokemon_name>"}, ..., "option_k":{"action":"<move_or_switch>", "target":"<move_name_or_switch_pokemon_name>"}}\n'''
             constraint_prompt_tot_2 = '''Select the best action from the following choices by considering their consequences: [OPTIONS]. Your output MUST be a JSON like:"decision":{"action":"<move_or_switch>", "target":"<move_name_or_switch_pokemon_name>"}\n'''
@@ -231,7 +319,28 @@ class LLMPlayer(Player):
 
         # Self-consistency with k = 3
         elif self.prompt_algo == "sc":
-            return self.sc(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim)
+            # Per-move timeout accounting for SC
+            start_time = time.time()
+            try:
+                return self.sc(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim)
+            except Exception as e:
+                print(f'SC failed with error: {e}')
+                # Fallback to damage calculator
+                move, _ = self.dmg_calc_move(battle)
+                if move is not None:
+                    progress_score = self._record_progress(battle)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='sc_exception', 
+                                        action_kind='move', action_label=str(getattr(move, 'order', '')), 
+                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                        near_timeout=False, progress_score=progress_score)
+                    return move
+                # Last resort
+                progress_score = self._record_progress(battle)
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='sc_exception_maxdmg', 
+                                    action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
+                                    tokens_prompt=0, tokens_completion=0, near_timeout=False, 
+                                    progress_score=progress_score)
+                return self.choose_max_damage_move(battle)
 
         # Tree of thought, k = 3
         elif self.prompt_algo == "tot":
@@ -282,18 +391,37 @@ class LLMPlayer(Player):
             return next_action
 
         elif self.prompt_algo == "minimax":
+            # Use original LLM-based minimax implementation with timeout protection
+            start_time = time.time()
             try:
-                # Initialize minimax optimizer if not already done
-                if self.use_optimized_minimax and not self._minimax_initialized:
-                    self._initialize_minimax_optimizer(battle)
-                    
-                if self.use_optimized_minimax:
-                    return self.tree_search_optimized(retries, battle)
-                else:
-                    return self.tree_search(retries, battle)
+                action = self.tree_search_optimized(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim)
+                
+                # Record metrics
+                progress_score = self._record_progress(battle)
+                elapsed = time.time() - start_time
+                self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
+                                    action_kind='minimax', action_label=str(action.message if hasattr(action, 'message') else action.order), 
+                                    max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                    near_timeout=(elapsed > self.move_time_limit_s - 2.0), progress_score=progress_score)
+                return action
+                
             except Exception as e:
-                print(f'minimax step failed ({e}). Using dmg calc')
-                print(f'Exception: {e}', 'passed')
+                print(f'Minimax failed ({e}). Using fallback')
+                # Fallback to damage calculator
+                move, _ = self.dmg_calc_move(battle)
+                if move is not None:
+                    progress_score = self._record_progress(battle)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_exception', 
+                                        action_kind='move', action_label=str(getattr(move, 'order', '')), 
+                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                        near_timeout=False, progress_score=progress_score)
+                    return move
+                # Last resort
+                progress_score = self._record_progress(battle)
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_exception_maxdmg', 
+                                    action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
+                                    tokens_prompt=0, tokens_completion=0, near_timeout=False, 
+                                    progress_score=progress_score)
                 return self.choose_max_damage_move(battle)
 
         
@@ -437,7 +565,7 @@ class LLMPlayer(Player):
 
         # Per-move timeout start and accounting
         start_time = time.time()
-        near_timeout_threshold = 5.0
+        near_timeout_threshold = max(0.0, self.move_time_limit_s - 2.0)
         max_tokens = 300
         prev_prompt_tokens = getattr(self.llm, 'prompt_tokens', 0)
         prev_completion_tokens = getattr(self.llm, 'completion_tokens', 0)
@@ -445,18 +573,18 @@ class LLMPlayer(Player):
         for i in range(retries):
             self._bump_llm_calls(battle)
             # Timeout fallback: choose deterministic damage move
-            if time.time() - start_time > 10:
+            if time.time() - start_time > self.move_time_limit_s:
                 print('LLM timeout, using damage calculator fallback')
                 move, _ = self.dmg_calc_move(battle)
                 if move is not None:
                     progress_score = self._record_progress(battle)
                     self._record_timeout(battle, avoided=False)
-                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='timeout', action_kind='move', action_label=str(getattr(move, 'order', '')), max_tokens=max_tokens,
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='timeout', action_kind='move', action_label=str(getattr(move, 'order', '')), max_tokens=self.max_tokens,
                                         tokens_prompt=0, tokens_completion=0, near_timeout=True, progress_score=progress_score)
                     return move
                 progress_score = self._record_progress(battle)
                 self._record_timeout(battle, avoided=False)
-                self._record_metric(battle, start_time, json_ok=False, fallback_reason='timeout', action_kind='max_damage', action_label='', max_tokens=max_tokens,
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='timeout', action_kind='max_damage', action_label='', max_tokens=self.max_tokens,
                                     tokens_prompt=0, tokens_completion=0, near_timeout=True, progress_score=progress_score)
                 return self.choose_max_damage_move(battle)
 
@@ -465,7 +593,7 @@ class LLMPlayer(Player):
                                             user_prompt=state_prompt_io,
                                             model=self.backend,
                                             temperature=self.temperature,
-                                            max_tokens=max_tokens,
+                                            max_tokens=self.max_tokens,
                                             # stop=["reason"],
                                             json_format=True,
                                             actions=actions)
@@ -558,13 +686,34 @@ class LLMPlayer(Player):
                     action_label = llm_action_json.get('move') or llm_action_json.get('switch') or llm_action_json.get('dynamax') or llm_action_json.get('terastallize') or ''
                     self._record_action_label(battle, action_kind, str(action_label))
                     progress_score = self._record_progress(battle)
-                    self._record_metric(battle, start_time, json_ok=True, fallback_reason='', action_kind=action_kind, action_label=str(action_label), max_tokens=max_tokens,
+                    self._record_metric(battle, start_time, json_ok=True, fallback_reason='', action_kind=action_kind, action_label=str(action_label), max_tokens=self.max_tokens,
                                         tokens_prompt=d_prompt, tokens_completion=d_comp, near_timeout=near_timeout, progress_score=progress_score)
                     break
             except Exception as e:
                 print(f'Exception (JSON/selection): {e}', 'passed')
+                # Try forgiving recovery from free-form text
+                try:
+                    recovered = self._recover_action_from_text(llm_output if 'llm_output' in locals() else '', battle)
+                    if recovered is not None:
+                        progress_score = self._record_progress(battle)
+                        near_timeout = (time.time() - start_time) > near_timeout_threshold
+                        if near_timeout:
+                            self._record_timeout(battle, avoided=True)
+                        self._record_metric(battle, start_time, json_ok=False, fallback_reason='json_recovery', action_kind='move_or_switch', action_label=str(recovered.order if hasattr(recovered,'order') else ''), max_tokens=self.max_tokens,
+                                            tokens_prompt=0, tokens_completion=0, near_timeout=near_timeout, progress_score=progress_score)
+                        return recovered
+                except Exception:
+                    pass
                 continue
         if next_action is None:
+            # Check if we're trapped with no valid actions
+            if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
+                print(f'Pokemon {battle.active_pokemon.species} is trapped - no valid actions available')
+                progress_score = self._record_progress(battle)
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='trapped_no_actions', action_kind='default', action_label='', max_tokens=self.max_tokens,
+                                    tokens_prompt=0, tokens_completion=0, near_timeout=False, progress_score=progress_score)
+                return self.choose_default_move()
+            
             print('No action found. Choosing max damage move')
             try:
                 print('No action found', llm_action_json, actions, dont_verify)
@@ -576,16 +725,77 @@ class LLMPlayer(Player):
             near_timeout = (time.time() - start_time) > near_timeout_threshold
             if near_timeout:
                 self._record_timeout(battle, avoided=True)
-            self._record_metric(battle, start_time, json_ok=False, fallback_reason='no_valid_action', action_kind='max_damage', action_label='', max_tokens=max_tokens,
+            self._record_metric(battle, start_time, json_ok=False, fallback_reason='no_valid_action', action_kind='max_damage', action_label='', max_tokens=self.max_tokens,
                                 tokens_prompt=0, tokens_completion=0, near_timeout=near_timeout, progress_score=progress_score)
             next_action = self.choose_max_damage_move(battle)
         return next_action
 
     def sc(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim):
-        actions = [self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim) for i in range(self.K)]
+        # Track timeout for SC algorithm
+        start_time = time.time()
+        actions = []
+        
+        # SC needs tighter deadline since it makes multiple calls
+        # Reserve at least 2 seconds for fallback
+        sc_deadline = self.move_time_limit_s - 2.0
+        
+        # For SC with K>1, we need even tighter control
+        per_sample_budget = sc_deadline / max(self.K, 1)
+        
+        # Collect K samples, but with timeout protection
+        for i in range(self.K):
+            # Check if we've exceeded time limit (with buffer for fallback)
+            elapsed = time.time() - start_time
+            if elapsed > sc_deadline or (i > 0 and elapsed > per_sample_budget * (i + 0.5)):
+                print(f'SC timeout after {i} samples, using fallback')
+                # If we have at least one action, use it
+                if actions:
+                    progress_score = self._record_progress(battle)
+                    self._record_timeout(battle, avoided=False)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='sc_timeout_partial', 
+                                        action_kind='first_action', action_label=str(actions[0].message), 
+                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                        near_timeout=True, progress_score=progress_score)
+                    return actions[0]
+                # Otherwise fall back to damage calculator
+                move, _ = self.dmg_calc_move(battle)
+                if move is not None:
+                    progress_score = self._record_progress(battle)
+                    self._record_timeout(battle, avoided=False)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='sc_timeout_dmgcalc', 
+                                        action_kind='move', action_label=str(getattr(move, 'order', '')), 
+                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                        near_timeout=True, progress_score=progress_score)
+                    return move
+                # Last resort: max damage move
+                progress_score = self._record_progress(battle)
+                self._record_timeout(battle, avoided=False)
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='sc_timeout_maxdmg', 
+                                    action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
+                                    tokens_prompt=0, tokens_completion=0, near_timeout=True, 
+                                    progress_score=progress_score)
+                return self.choose_max_damage_move(battle)
+            
+            # Get one sample
+            action = self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, 
+                            state_action_prompt, battle, sim)
+            actions.append(action)
+        
+        # Vote on the most common action
         action_message = [action.message for action in actions]
         _, counts = np.unique(action_message, return_counts=True)
         index = np.argmax(counts)
+        
+        # Record successful SC completion
+        progress_score = self._record_progress(battle)
+        near_timeout = (time.time() - start_time) > max(0.0, self.move_time_limit_s - 2.0)
+        if near_timeout:
+            self._record_timeout(battle, avoided=True)
+        self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
+                            action_kind='sc_vote', action_label=str(actions[index].message), 
+                            max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                            near_timeout=near_timeout, progress_score=progress_score)
+        
         return actions[index]
     
     def estimate_matchup(self, sim: LocalSim, battle: Battle, mon: Pokemon, mon_opp: Pokemon, is_opp: bool=False) -> Tuple[Move, int]:
@@ -746,7 +956,7 @@ class LLMPlayer(Player):
         else:
             return None
     
-    def tree_search(self, retries, battle, sim=None, return_opp = False) -> BattleOrder:
+    def tree_search(self, retries, battle, sim=None, return_opp = False, start_time=None) -> BattleOrder:
         # generate local simulation
         root = SimNode(battle, 
                         self.move_effect,
@@ -767,8 +977,47 @@ class LLMPlayer(Player):
             ]
         leaf_nodes = []
         # create node and add to q B times
-        start_time = time.time()
+        if start_time is None:
+            start_time = time.time()
+        internal_start = time.time()
+        
+        # Set a hard deadline for minimax - leave 1s for final processing
+        minimax_deadline = start_time + self.move_time_limit_s - 1.0
+        
         while len(q) != 0:
+            # Check timeout before processing next node
+            if time.time() > minimax_deadline:
+                print(f'Minimax timeout: explored {len(leaf_nodes)} leaf nodes, returning best so far')
+                # If we have at least explored some nodes, use them
+                if leaf_nodes:
+                    # Use whatever we have explored so far
+                    break
+                # Otherwise, fall back to damage calculator
+                dmg_calc_out, _ = self.dmg_calc_move(battle)
+                if dmg_calc_out is not None:
+                    progress_score = self._record_progress(battle)
+                    self._record_timeout(battle, avoided=False)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_timeout_dmgcalc', 
+                                        action_kind='move', action_label=str(getattr(dmg_calc_out, 'order', '')), 
+                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                        near_timeout=True, progress_score=progress_score)
+                    if return_opp:
+                        try:
+                            action_opp, _ = self.estimate_matchup(root.simulation, battle, 
+                                                               battle.opponent_active_pokemon, 
+                                                               battle.active_pokemon, is_opp=True)
+                            return dmg_calc_out, self.create_order(action_opp) if action_opp else None
+                        except:
+                            return dmg_calc_out, None
+                    return dmg_calc_out
+                # Last resort: max damage move
+                progress_score = self._record_progress(battle)
+                self._record_timeout(battle, avoided=False)
+                self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_timeout_maxdmg', 
+                                    action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
+                                    tokens_prompt=0, tokens_completion=0, near_timeout=True, 
+                                    progress_score=progress_score)
+                return self.choose_max_damage_move(battle)
             node = q.pop(0)
             # choose node for expansion
             # generate B actions
@@ -934,6 +1183,17 @@ class LLMPlayer(Player):
             #     return panic_move
             # simulate outcome
             if node.depth < self.K:
+                # Further limit branching if we're running low on time
+                time_remaining = minimax_deadline - time.time()
+                if time_remaining < 2.0:  # Less than 2 seconds left
+                    # Only explore 1 action each when low on time
+                    player_actions = player_actions[:1]
+                    opponent_actions = opponent_actions[:1]
+                else:
+                    # Normal limits - already limited to 2 each in the generation code above
+                    player_actions = player_actions[:2]
+                    opponent_actions = opponent_actions[:2]
+                
                 for action_p in player_actions:
                     for action_o in opponent_actions:
                         node_new = copy(node)
@@ -974,11 +1234,22 @@ class LLMPlayer(Player):
         
         action, _, action_opp = get_tree_action(root)
         end_time = time.time()
+        
+        # Record successful minimax completion
+        progress_score = self._record_progress(battle)
+        near_timeout = (end_time - start_time) > max(0.0, self.move_time_limit_s - 2.0)
+        if near_timeout:
+            self._record_timeout(battle, avoided=True)
+        self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
+                            action_kind='minimax', action_label=str(action.message if hasattr(action, 'message') else action.order), 
+                            max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                            near_timeout=near_timeout, progress_score=progress_score)
+        
         if return_opp:
             return action, action_opp
         return action
 
-    def tree_search_optimized(self, retries, battle, sim=None, return_opp=False) -> BattleOrder:
+    def tree_search_optimized(self, retries, battle, sim=None, return_opp=False, start_time=None) -> BattleOrder:
         """
         Optimized version of tree_search using object pooling and caching.
         
@@ -988,7 +1259,9 @@ class LLMPlayer(Player):
         - Battle state caching to avoid repeated computations
         """
         optimizer = get_minimax_optimizer()
-        start_time = time.time()
+        if start_time is None:
+            start_time = time.time()
+        internal_start = time.time()
         
         try:
             # Create optimized root node
@@ -1062,7 +1335,44 @@ class LLMPlayer(Player):
             q = [root]
             leaf_nodes = []
             
+            # Set a hard deadline for minimax - leave 1s for final processing
+            minimax_deadline = start_time + self.move_time_limit_s - 1.0
+            
             while len(q) != 0:
+                # Check timeout before processing next node
+                if time.time() > minimax_deadline:
+                    print(f'Minimax timeout: explored {len(leaf_nodes)} leaf nodes, returning best so far')
+                    # If we have at least explored some nodes, use them
+                    if leaf_nodes:
+                        # Use whatever we have explored so far
+                        break
+                    # Otherwise, fall back to damage calculator
+                    dmg_calc_out, _ = self.dmg_calc_move(battle)
+                    if dmg_calc_out is not None:
+                        progress_score = self._record_progress(battle)
+                        self._record_timeout(battle, avoided=False)
+                        self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_timeout_dmgcalc', 
+                                            action_kind='move', action_label=str(getattr(dmg_calc_out, 'order', '')), 
+                                            max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                            near_timeout=True, progress_score=progress_score)
+                        if return_opp:
+                            try:
+                                action_opp, _ = self.estimate_matchup(root.simulation, battle, 
+                                                                   battle.opponent_active_pokemon, 
+                                                                   battle.active_pokemon, is_opp=True)
+                                return dmg_calc_out, self.create_order(action_opp) if action_opp else None
+                            except:
+                                return dmg_calc_out, None
+                        return dmg_calc_out
+                    # Last resort: max damage move
+                    progress_score = self._record_progress(battle)
+                    self._record_timeout(battle, avoided=False)
+                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_timeout_maxdmg', 
+                                        action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
+                                        tokens_prompt=0, tokens_completion=0, near_timeout=True, 
+                                        progress_score=progress_score)
+                    return self.choose_max_damage_move(battle)
+                
                 node = q.pop(0)
                 
                 # Get available actions efficiently 
@@ -1169,8 +1479,19 @@ class LLMPlayer(Player):
                 
                 # Create child nodes efficiently (if not at depth limit)
                 if node.depth < self.K and player_actions and opponent_actions:
-                    for action_p in player_actions[:2]:  # Limit to 2 player actions for performance
-                        for action_o in opponent_actions[:2]:  # Limit to 2 opponent actions for performance
+                    # Further limit branching if we're running low on time
+                    time_remaining = minimax_deadline - time.time()
+                    if time_remaining < 2.0:  # Less than 2 seconds left
+                        # Only explore 1 action each when low on time
+                        player_limit = 1
+                        opponent_limit = 1
+                    else:
+                        # Normal limits
+                        player_limit = 2
+                        opponent_limit = 2
+                    
+                    for action_p in player_actions[:player_limit]:
+                        for action_o in opponent_actions[:opponent_limit]:
                             try:
                                 child_node = node.create_child_node(action_p, action_o)
                                 q.append(child_node)
@@ -1210,9 +1531,19 @@ class LLMPlayer(Player):
             # Log performance stats
             end_time = time.time()
             stats = optimizer.get_performance_stats()
-            print(f"⚡ Optimized minimax: {end_time - start_time:.2f}s, "
+            print(f"⚡ Optimized minimax: {end_time - internal_start:.2f}s, "
                   f"Pool reuse: {stats['pool_stats']['reuse_rate']:.2f}, "
                   f"Cache hit rate: {stats['cache_stats']['hit_rate']:.2f}")
+            
+            # Record successful minimax completion
+            progress_score = self._record_progress(battle)
+            near_timeout = (end_time - start_time) > max(0.0, self.move_time_limit_s - 2.0)
+            if near_timeout:
+                self._record_timeout(battle, avoided=True)
+            self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
+                                action_kind='minimax', action_label=str(action.message if hasattr(action, 'message') else action.order), 
+                                max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
+                                near_timeout=near_timeout, progress_score=progress_score)
             
             if return_opp:
                 return action, action_opp

@@ -3,7 +3,7 @@ from poke_env.player.player import Player
 from poke_env.player.baselines import AbyssalPlayer, MaxBasePowerPlayer, OneStepPlayer
 from poke_env.player.random_player import RandomPlayer
 from poke_env.ps_client.account_configuration import AccountConfiguration
-from poke_env.ps_client.server_configuration import ShowdownServerConfiguration
+from poke_env.ps_client.server_configuration import ShowdownServerConfiguration, ServerConfiguration
 from poke_env.teambuilder import Teambuilder
 from numpy.random import randint
 import importlib
@@ -26,18 +26,36 @@ class TeamSet(Teambuilder):
             "any_name.gen1ou_team").
     """
 
-    def __init__(self, team_file_dir: str, battle_format: str):
+    def __init__(self, team_file_dir: str, battle_format: str, min_elo: int = None, max_elo: int = None):
         super().__init__()
         self.team_file_dir = team_file_dir
         self.battle_format = battle_format
+        self.min_elo = min_elo
+        self.max_elo = max_elo
         self.team_files = self._find_team_files()
 
     def _find_team_files(self):
         team_files = []
+        import re
+        elo_re = re.compile(r"(?:elo|rating)[^\d]*(\d{3,4})", re.IGNORECASE)
         for root, _, files in os.walk(self.team_file_dir):
             for file in files:
                 if file.endswith(f".{self.battle_format}_team"):
-                    team_files.append(os.path.join(root, file))
+                    path = os.path.join(root, file)
+                    # Optional Elo filter via filename hint
+                    if self.min_elo is not None or self.max_elo is not None:
+                        m = elo_re.search(file)
+                        if m:
+                            try:
+                                elo = int(m.group(1))
+                                if self.min_elo is not None and elo < self.min_elo:
+                                    continue
+                                if self.max_elo is not None and elo > self.max_elo:
+                                    continue
+                            except Exception:
+                                pass
+                        # If no Elo hint in filename, include by default
+                    team_files.append(path)
         return team_files
 
     def yield_team(self):
@@ -51,7 +69,7 @@ class TeamSet(Teambuilder):
                 mon.nickname = mon.species
         return self.join_team(team)
 
-def get_metamon_teams(battle_format: str, set_name: str) -> TeamSet:
+def get_metamon_teams(battle_format: str, set_name: str, min_elo: int = None, max_elo: int = None) -> TeamSet:
     """
     Download a set of teams from huggingface (if necessary) and return a TeamSet.
 
@@ -74,7 +92,7 @@ def get_metamon_teams(battle_format: str, set_name: str) -> TeamSet:
         raise ValueError(
             f"Cannot locate valid team directory for format {battle_format} at path {path}"
         )
-    return TeamSet(path, battle_format)
+    return TeamSet(path, battle_format, min_elo=min_elo, max_elo=max_elo)
 
 def load_random_team(id=None, battle_format: str = 'gen9ou'):
     """Load a random static team for the given battle format.
@@ -165,13 +183,26 @@ def get_llm_player(args,
                    USERNAME: str='', 
                    PASSWORD: str='', 
                    online: bool=False,
-                   log_level=None) -> Player:
+                   log_level=None,
+                   server: str = None) -> Player:
     from pokechamp.llm_player import LLMPlayer
     from pokechamp.prompts import prompt_translate, state_translate2
     
     server_config = None
     if online:
-        server_config = ShowdownServerConfiguration
+        # Choose server configuration
+        srv = (server or getattr(args, 'server', None) or 'showdown').lower()
+        if srv in ('pokeagent', 'pac', 'competition'):
+            # Use full wss URL per official spec
+            server_config = ServerConfiguration(
+                "wss://pokeagentshowdown.com/showdown/websocket",
+                "https://play.pokemonshowdown.com/action.php?",
+            )
+        elif srv in ('showdown', 'official'):
+            server_config = ShowdownServerConfiguration
+        else:
+            # default to official showdown config
+            server_config = ShowdownServerConfiguration
     if USERNAME == '':
         USERNAME = name
     if name == 'abyssal':

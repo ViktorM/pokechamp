@@ -1100,6 +1100,93 @@ def state_translate(sim: LocalSim,
         system_prompt = system_prompt + sim.strategy
 
         state_prompt = battle_prompt + opponent_prompt + active_pokemon_prompt + move_prompt + switch_prompt
+
+        # Gen1-specific context: PP and clauses, revealed roster
+        if sim.gen.gen == 1:
+            try:
+                # Our move PP snapshot (prefer available moves; fallback to known moves)
+                pp_lines = []
+                moves_iter = battle.available_moves if battle.available_moves else list(battle.active_pokemon.moves.values())
+                if moves_iter:
+                    for mv in moves_iter:
+                        try:
+                            pp_lines.append(f"{mv.id}:{mv.current_pp}/{mv.max_pp}")
+                        except Exception:
+                            pp_lines.append(f"{getattr(mv,'id','?')}:?/?)")
+                our_pp_str = ", ".join(pp_lines)
+            except Exception:
+                our_pp_str = ""
+
+            # Revealed opponent roster (seen active/fainted or with known HP)
+            try:
+                revealed_opp = []
+                for mon in battle.opponent_team.values():
+                    if getattr(mon, 'active', False) or getattr(mon, 'fainted', False) or getattr(mon, 'current_hp', None) is not None:
+                        if mon.species:
+                            revealed_opp.append(mon.species)
+                revealed_opp_str = ", ".join(revealed_opp) if revealed_opp else "(none revealed)"
+            except Exception:
+                revealed_opp_str = ""
+
+            # Opponent current sleep/freeze statuses for clause awareness
+            try:
+                asleep_count = sum(1 for mon in battle.opponent_team.values() if getattr(mon, 'status', None) and mon.status.name.lower()=="slp")
+                frozen_count = sum(1 for mon in battle.opponent_team.values() if getattr(mon, 'status', None) and mon.status.name.lower()=="frz")
+            except Exception:
+                asleep_count, frozen_count = 0, 0
+
+            # Gen1 clauses and mechanics snapshot
+            try:
+                freeze_clause_engaged = any(getattr(mon, 'status', None) and getattr(mon.status, 'name', '').lower() == 'frz' for mon in battle.opponent_team.values())
+            except Exception:
+                freeze_clause_engaged = False
+            try:
+                opp_asleep_by_me = sum(1 for mon in battle.opponent_team.values() if getattr(mon, 'status', None) and getattr(mon.status, 'name', '').lower() == 'slp')
+                sleep_clause_used_by_me = opp_asleep_by_me >= 1
+            except Exception:
+                opp_asleep_by_me, sleep_clause_used_by_me = 0, False
+            # Use reliable trap state if available, otherwise fall back to heuristic
+            try:
+                if sim.trap_state and isinstance(sim.trap_state, dict):
+                    partial_trap_active = sim.trap_state.get('active', False)
+                    partial_trap_turns = sim.trap_state.get('turns', 0)
+                    trap_source = sim.trap_state.get('source', 'unknown')
+                    trap_move = sim.trap_state.get('move', 'unknown')
+                    if partial_trap_active:
+                        # Gen1 wrap lasts 2-5 turns
+                        partial_trap_turns_left = f"{partial_trap_turns} (by {trap_source} using {trap_move})"
+                    else:
+                        partial_trap_turns_left = "0"
+                else:
+                    # Fallback: Heuristic partial-trap detection from recent history
+                    recent_msgs = battle.battle_msg_history.split("[sep]")[-6:]
+                    trap_keys = ("wrap", "bind", "clamp", "fire spin", "firespin", "partially trapped", "was trapped")
+                    partial_trap_active = any(any(k in msg.lower() for k in trap_keys) for msg in recent_msgs)
+                    partial_trap_turns_left = "unknown"
+            except Exception:
+                partial_trap_active = False
+                partial_trap_turns_left = "unknown"
+            try:
+                toxic_counter = ""
+                if getattr(battle.active_pokemon, 'status', None) and getattr(battle.active_pokemon.status, 'name', '').lower() in ("tox", "psn"):
+                    toxic_counter = "active"
+            except Exception:
+                toxic_counter = ""
+
+            gen1_rules = []
+            gen1_rules.append("Gen1 Rules: Sleep Clause (only one opposing Pokémon may be put to sleep by you at a time), Freeze Clause (only one opposing Pokémon may be frozen). No items, no abilities, no team preview.")
+            if our_pp_str:
+                gen1_rules.append(f"Your move PP: {our_pp_str}")
+            if revealed_opp_str:
+                gen1_rules.append(f"Revealed opponent roster: {revealed_opp_str}")
+            gen1_rules.append(f"Opp status counts — asleep:{asleep_count}, frozen:{frozen_count}")
+            gen1_rules.append(f"Clauses — freeze_clause_engaged:{int(freeze_clause_engaged)}, sleep_clause_used_by_me:{int(sleep_clause_used_by_me)}, opp_asleep_by_me:{opp_asleep_by_me}")
+            gen1_rules.append(f"Partial trapping — active:{int(partial_trap_active)}, turns_left:{partial_trap_turns_left}")
+            if toxic_counter:
+                gen1_rules.append(f"Toxic — {toxic_counter}")
+            gen1_rules.append("Assume Gen‑1 mechanics; do not invent abilities or items; status/hazard set is limited; prefer PP‑positive lines when ahead; obey Sleep/Freeze Clause; account for partial trapping and toxic escalation.")
+
+            state_prompt = state_prompt + "\n" + "\n".join(gen1_rules) + "\n"
         state_action_prompt = action_prompt + action_prompt_move + action_prompt_switch
 
         return system_prompt, state_prompt, state_action_prompt

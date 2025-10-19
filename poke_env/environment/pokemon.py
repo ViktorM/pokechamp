@@ -891,11 +891,7 @@ class Pokemon:
             observed_moves: List of observed moves to improve Bayesian predictions
             battle: Battle context for team information
         """
-        # Check if this is Gen1 - use hardcoded sets for better accuracy
-        if battle and hasattr(battle, '_format') and 'gen1' in battle._format.lower():
-            from poke_env.data.static.gen1_common_sets import get_gen1_stats
-            return get_gen1_stats(self.species)
-        
+        # For Gen1, try Bayesian first, then fall back to hardcoded sets
         # Try Bayesian predictions first if requested or if we have context
         if guess_type == 'bayesian' or (observed_moves and battle):
             bayesian_result = self._get_bayesian_stats(observed_moves, battle)
@@ -947,7 +943,13 @@ class Pokemon:
         """Get Bayesian stat predictions for this Pokemon."""
         # Use singleton predictor to avoid loading multiple models
         from bayesian.predictor_singleton import get_pokemon_predictor
-        predictor = get_pokemon_predictor()
+        
+        # Get battle format if available
+        battle_format = None
+        if battle and hasattr(battle, '_format'):
+            battle_format = battle._format
+            
+        predictor = get_pokemon_predictor(battle_format)
         
         # Normalize Pokemon names
         def normalize_pokemon_name(name):
@@ -1065,7 +1067,7 @@ class Pokemon:
             probabilities = predictor.predict_component_probabilities(
                 species_norm, 
                 teammates=opponent_pokemon,
-                observed_moves=normalized_moves
+                revealed_moves=normalized_moves
             )
         except Exception as e:
             print(f'Bayesian prediction failed for {species_norm}: {e}')
@@ -1165,12 +1167,17 @@ class Pokemon:
     def calculate_stats(self, ivs=(31,) * 6, evs=(85,) * 6, battle_format='random'):
         nature = None
         if not 'random' in battle_format:
-            # Only guess stats for Gen9 (where we have sets data)
-            # For Gen1-8, use default balanced EVs
-            if 'gen9' in battle_format.lower():
-                evs, nature = self.guess_stats()
-            else:
-                # Use default balanced EVs for older gens
+            # Try to guess stats for any format (Bayesian predictor is format-aware)
+            # Create a minimal battle-like object with format info
+            class FormatInfo:
+                def __init__(self, fmt):
+                    self._format = fmt
+            
+            try:
+                battle_info = FormatInfo(battle_format)
+                evs, nature = self.guess_stats(guess_type='bayesian', battle=battle_info)
+            except:
+                # Fall back to default balanced EVs if guess fails
                 evs = [85, 85, 85, 85, 85, 85]
                 nature = 'Hardy'  # Neutral nature
         def common_pkmn_stat_calc(stat: int, iv: int, ev: int, level: int):

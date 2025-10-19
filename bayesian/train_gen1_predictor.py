@@ -24,12 +24,13 @@ class Gen1BayesianPredictor(BayesianTeamPredictor):
         
     def _train_from_data(self):
         """Override to train on Gen1OU data instead of Gen9OU."""
-        # Get Gen1OU team data
-        team_set = get_metamon_teams("gen1ou", "modern_replays")
+        # Get Gen1OU team data - filter for quality (1500+ ELO)
+        MIN_ELO = 1500  # Only learn from decent players
+        team_set = get_metamon_teams("gen1ou", "modern_replays", min_elo=MIN_ELO)
         team_files = team_set.team_files
         
-        print(f"Training on {len(team_files)} Gen1OU teams...")
-        print("This is faster than Gen9 training due to fewer teams (13k vs 1M)")
+        print(f"Training on {len(team_files)} Gen1OU teams (ELO {MIN_ELO}+)...")
+        print("Filtering by ELO ensures we learn from competitive sets only")
         
         for file_path in tqdm(team_files, desc="Processing Gen1 teams"):
             try:
@@ -112,12 +113,11 @@ def main():
             # Test move prediction for Tauros
             tauros_moves = predictor.predict_component_probabilities(
                 "Tauros", 
-                teammates=test_revealed,
-                observed_moves=["Body Slam"]
+                teammates=test_revealed
             )
             
             if 'moves' in tauros_moves:
-                print(f"\nPredicted moves for Tauros (given Body Slam):")
+                print(f"\nPredicted moves for Tauros:")
                 for move, prob in tauros_moves['moves'][:5]:
                     print(f"  {move}: {prob:.2%}")
         

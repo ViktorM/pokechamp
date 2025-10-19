@@ -527,7 +527,8 @@ class BayesianTeamPredictor:
         
         # Restore other attributes...
         self.total_teams = cache_data['total_teams']
-        print(f"Loaded model trained on {self.total_teams} teams")
+        self.is_trained = True  # Mark as trained after loading
+        # print(f"Loaded model trained on {self.total_teams} teams")
 
 
 def main():

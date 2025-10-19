@@ -145,6 +145,7 @@ class LocalSim():
         self.strategy = _strategy
         self.format = format
         self.prompt_translate = prompt_translate
+        self.trap_state = None  # Will be set by LLMPlayer if available
 
         self.switch_set = set()
 
@@ -678,7 +679,8 @@ class LocalSim():
         """Get Bayesian move predictions for opponent Pokemon."""
         try:
             # Get the singleton predictor from the battle class
-            predictor = self.get_pokemon_predictor()
+            from bayesian.predictor_singleton import get_pokemon_predictor
+            predictor = get_pokemon_predictor(self.format)
             
             # Normalize Pokemon names
             def normalize_pokemon_name(name):
@@ -912,6 +914,9 @@ class LocalSim():
 
         return False
     
+    def set_trap_state(self, trap_state):
+        """Set trap state from LLMPlayer for use in prompts."""
+        self.trap_state = trap_state
     
 
     def state_translate(self, battle: Battle):
