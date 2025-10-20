@@ -19,6 +19,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from poke_env.environment.move import Move
 import time
 import json
+import hashlib
+import re
 from poke_env.data.gen_data import GenData
 from pokechamp.gpt_player import GPTPlayer
 from pokechamp.llama_player import LLAMAPlayer
@@ -728,6 +730,7 @@ class LLMPlayer(Player):
                 except Exception:
                     pass
                 continue
+
         if next_action is None:
             # Check if we're trapped with no valid actions
             if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
@@ -764,10 +767,48 @@ class LLMPlayer(Player):
         except Exception:
             return None
 
+    def _extract_pick_from_text(self, s: str) -> Optional[int]:
+        """Fallback: try to extract a pick id from free-form text."""
+        try:
+            # 1) Try to find "pick": <int>
+            m = re.search(r'"pick"\s*:\s*(\d+)', s)
+            if m:
+                return int(m.group(1))
+            # 2) Try to find standalone integer after the word pick
+            m = re.search(r'pick[^\d]*(\d+)', s, flags=re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+        return None
+
     def _compute_state_hash(self, battle: AbstractBattle) -> str:
-        """Compute a hash of the current battle state."""
-        # Simple version - could be more sophisticated
-        return f"{battle.battle_tag}-{battle.turn}-{hash(str(battle.active_pokemon.species))%10000:04x}"
+        """Compute a deterministic sha1 hash of key battle state fields."""
+        try:
+            active = battle.active_pokemon
+            opp = battle.opponent_active_pokemon
+            state_obj = {
+                "tag": battle.battle_tag,
+                "turn": battle.turn,
+                "me": {
+                    "species": getattr(active, "species", ""),
+                    "hp": getattr(active, "current_hp_fraction", 0.0),
+                    "status": str(getattr(active, "status", "")),
+                },
+                "opp": {
+                    "species": getattr(opp, "species", ""),
+                    "hp": getattr(opp, "current_hp_fraction", 0.0),
+                    "status": str(getattr(opp, "status", "")),
+                },
+                "trapped": bool(getattr(battle, "trapped", False)),
+                "moves": [m.id for m in (battle.available_moves or [])],
+                "switches": [p.species for p in (battle.available_switches or [])],
+            }
+            payload = json.dumps(state_obj, sort_keys=True, separators=(",", ":")).encode()
+            return hashlib.sha1(payload).hexdigest()  # stable across runs
+        except Exception:
+            # Fallback to simple tag-turn string if anything goes wrong
+            return f"{battle.battle_tag}-{battle.turn}"
 
     def _get_progress_score(self, battle: AbstractBattle) -> Dict[str, float]:
         """Get current progress metrics."""
@@ -777,6 +818,20 @@ class LLMPlayer(Player):
             "status_adv": 1.0 if battle.opponent_active_pokemon.status else 0.0,
             "net_chip_last3": 0.0  # Placeholder
         }
+
+    def _get_budget_class(self) -> str:
+        """Rough budget class from configured move time limit.
+        C0: tight budget; C1/C2: more relaxed.
+        """
+        try:
+            t = float(self.move_time_limit_s or 8.0)
+        except Exception:
+            t = 8.0
+        if t >= 12.0:
+            return "C2"
+        if t >= 9.0:
+            return "C1"
+        return "C0"
 
     def _prune_candidates(self, battle: AbstractBattle, actions: List[Dict], pre_scores: Dict[str, float], max_actions: int = 4) -> List[Dict]:
         """Smart pruning to keep diverse action types."""
@@ -788,8 +843,25 @@ class LLMPlayer(Player):
         moves.sort(key=lambda x: x[1], reverse=True)
         switches.sort(key=lambda x: x[1], reverse=True)
         
+        # Avoid pointless healing/status moves at high HP or no-effect statuses
+        healing_moves = {"softboiled", "recover", "rest", "milkdrink", "synthesis", "moonlight", "morningsun"}
+        para_moves = {"thunderwave", "stunspore", "glare"}
+        opp_status = getattr(getattr(battle, 'opponent_active_pokemon', None), 'status', None)
+        hp_frac = getattr(getattr(battle, 'active_pokemon', None), 'current_hp_fraction', 1.0)
+        filtered_moves: List[Tuple[Dict, float]] = []
+        for a, v in moves:
+            if a.get("type") == "move":
+                mv = a.get("move", "")
+                if mv in healing_moves and hp_frac >= 0.9:
+                    # Skip healing when essentially full HP
+                    continue
+                if mv in para_moves and opp_status is not None:
+                    # Skip paralysis attempts if opponent already has a status
+                    continue
+            filtered_moves.append((a, v))
+
         # Take top moves and best switch
-        pruned = [a for a, _ in moves[:max_actions-1]]
+        pruned = [a for a, _ in filtered_moves[:max_actions-1]]
         if switches and len(pruned) < max_actions:
             pruned.append(switches[0][0])
         
@@ -850,6 +922,12 @@ class LLMPlayer(Player):
         if not legal_actions:
             return self.choose_default_move()
         
+        # Calculate opponent danger once (estimated turns for opponent to KO us)
+        try:
+            _, opp_turns_to_ko = self.estimate_matchup(sim, battle, battle.opponent_active_pokemon, battle.active_pokemon, is_opp=True)
+        except Exception:
+            opp_turns_to_ko = np.inf
+
         # Calculate pre-scores using damage calculator for moves
         pre_scores = {}
         for action in legal_actions:
@@ -858,6 +936,7 @@ class LLMPlayer(Player):
                 move_name = action["move"]
                 try:
                     move = Move(move_name, gen=sim.gen.gen)
+                    hp_frac = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
                     if move.category != MoveCategory.STATUS:
                         # Use turns to faint as inverse pre-score
                         turns = get_number_turns_faint(battle.active_pokemon, move, battle.opponent_active_pokemon, 
@@ -865,8 +944,50 @@ class LLMPlayer(Player):
                                                      boosts2=battle.opponent_active_pokemon._boosts.copy())
                         # Convert turns to score (1 turn = 1.0, 2 turns = 0.5, etc.)
                         pre_score = min(1.0, 1.0 / max(1, turns))
+                        # If KO this turn, strongly prefer
+                        if turns <= 1:
+                            pre_score = 1.0
+                        # Explode only if KO or dying anyway (trade up)
+                        sd_moves = {"selfdestruct", "explosion"}
+                        if move.id in sd_moves:
+                            my_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
+                            # Compute alive counts to spot endgame
+                            try:
+                                my_alive = sum(1 for mon in battle.team.values() if not getattr(mon, 'fainted', False))
+                                opp_alive = sum(1 for mon in battle.opponent_team.values() if not getattr(mon, 'fainted', False))
+                            except Exception:
+                                my_alive, opp_alive = 6, 6
+                            endgame = (my_alive <= 2 or opp_alive <= 2)
+                            explode_ok = (turns <= 1) or ((opp_turns_to_ko is not None and opp_turns_to_ko <= 1) and my_hp <= 0.35) or endgame
+                            if not explode_ok:
+                                pre_score = 0.0
                     else:
-                        pre_score = 0.3  # Status moves get moderate score
+                        # Status/progress moves – contextual
+                        pre_score = 0.2
+                        mv_id = move.id
+                        healing_moves = {"softboiled", "recover", "rest", "milkdrink", "synthesis", "moonlight", "morningsun"}
+                        sleep_moves = {"spore", "sleeppowder", "hypnosis", "sing", "lovelykiss"}
+                        para_moves = {"thunderwave", "stunspore", "glare"}
+                        reflect_like = {"reflect", "lightscreen"}
+                        opp_status = getattr(battle.opponent_active_pokemon, 'status', None)
+
+                        # Healing: only valuable when low HP or in immediate danger
+                        if mv_id in healing_moves:
+                            if hp_frac >= 0.9 and (opp_turns_to_ko is None or opp_turns_to_ko > 1):
+                                pre_score = 0.0
+                            elif hp_frac <= 0.35 or (opp_turns_to_ko is not None and opp_turns_to_ko <= 1):
+                                pre_score = 0.6
+                            else:
+                                pre_score = 0.35
+                        elif mv_id in sleep_moves:
+                            # Strong progress in Gen1 if clause not already used; we lack tracking so give moderate
+                            pre_score = 0.55
+                        elif mv_id in para_moves:
+                            # Don't paralyze if already statused
+                            pre_score = 0.0 if opp_status is not None else 0.45
+                        elif mv_id in reflect_like:
+                            # Useful vs physical threats
+                            pre_score = 0.35
                     
                     # Apply Gen1 quirks if applicable
                     if sim.gen.gen == 1:
@@ -881,9 +1002,21 @@ class LLMPlayer(Player):
                 # Switches get lower pre-score
                 pre_scores[str(action["id"])] = 0.15
         
-        # Prune to top candidates
-        pruned_actions = self._prune_candidates(battle, legal_actions, pre_scores, max_actions=4)
-        pruned_map = {a["id"]: action_map[a["id"]] for a in pruned_actions}
+        # Budget-aware pruning: <=4 in C0, <=6 in C1/C2
+        budget_class = self._get_budget_class()
+        max_actions = 4 if budget_class == "C0" else 6
+        pruned_actions = self._prune_candidates(battle, legal_actions, pre_scores, max_actions=max_actions)
+
+        # Reindex pruned actions 0..N-1 for a cleaner contract
+        reindexed_actions = []
+        reindex_map = {}
+        for new_id, a in enumerate(pruned_actions):
+            reindexed = dict(a)
+            reindexed["id"] = new_id
+            reindexed_actions.append(reindexed)
+            reindex_map[new_id] = a["id"]  # new -> old
+        pruned_actions = reindexed_actions
+        pruned_map = {new_id: action_map[old_id] for new_id, old_id in reindex_map.items()}
         
         # Build battle context
         state_hash = self._compute_state_hash(battle)
@@ -894,39 +1027,54 @@ class LLMPlayer(Player):
         freeze_count = sum(1 for mon in battle.opponent_team.values() 
                           if mon.status == Status.FRZ and not mon.fainted)
         
-        # Filter pre-scores to only pruned actions
-        pruned_pre_scores = {str(a["id"]): pre_scores.get(str(a["id"]), 0.0) for a in pruned_actions}
-        
-        # Build ranking prompt with scores
-        constraint_prompt_rank = f'''You are a ranking function for Pokemon battles.
-Return ONLY a compact JSON with fields: state_hash, scores, pick.
-Do not include text before or after JSON.
+        # Filter pre-scores to only pruned actions (reindexed)
+        pruned_pre_scores = {str(a["id"]): pre_scores.get(str(reindex_map[a["id"]]), 0.0) for a in pruned_actions}
 
-Current state_hash: {state_hash}
-Legal actions: {json.dumps(pruned_actions, separators=(",", ":"))}
-Pre-computed scores: {json.dumps(pruned_pre_scores, separators=(",", ":"))}
+        # Pure JSON user payload per spec
+        user_ctx = {
+            "version": "ctx-1.2",
+            "format": getattr(self, "format", "gen9ou"),
+            "turn": battle.turn,
+            "state_hash": state_hash,
+            "mechanics": {
+                "tera": False,
+                "sleep_clause": True,
+                "freeze_clause": True,
+                "partial_trap_active": bool(getattr(battle, "trapped", False)),
+            },
+            "clause_state": {
+                "sleep_clause_used_by_me": False,
+                "freeze_clause_engaged": False,
+            },
+            "budget_class": budget_class,
+            "progress_score": self._get_progress_score(battle),
+            "legal_actions": pruned_actions,
+            "pre_scores": pruned_pre_scores,
+            "request": "rank_actions_by_winprob",
+        }
 
-Output format:
-{{"state_hash": "{state_hash}", "scores": {{"0": 0.45, "1": 0.52, ...}}, "pick": <best_id>}}
-
-Rules:
-- Scores must be floats in [0,1] representing win probability
-- "pick" must be the ID with highest score
-- Include scores for ALL provided action IDs
-'''
-        
-        state_prompt_rank = state_prompt + state_action_prompt + constraint_prompt_rank
+        rank_system_prompt = (
+            "You are a ranking function for a competitive Pokemon battle.\n"
+            "Return ONLY a compact JSON object with fields: state_hash, scores, pick.\n"
+            "Do not include any text before or after JSON. Do not explain your reasoning.\n"
+            "Scores must be floats in [0,1]. pick must be one of the provided action ids.\n"
+            "If two actions are tied, prefer lower variance (avoid Hyper Beam unless it KOs)."
+        )
+        state_prompt_rank = json.dumps(user_ctx, separators=(",", ":"))
         
         # Single LLM call
         best_pick = None
         for i in range(retries):
             try:
+                # TODO: make temp and max_tokens a parameter, and/or add to the documentation
+                temp_for_rank = 0.25
+                max_tokens_for_rank = min(int(self.max_tokens), 220)
                 llm_output = self.get_LLM_action(
-                    system_prompt=system_prompt,
+                    system_prompt=rank_system_prompt,
                     user_prompt=state_prompt_rank,
                     model=self.backend,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    temperature=temp_for_rank,
+                    max_tokens=max_tokens_for_rank,
                     json_format=True,
                     reasoning_effort=self.reasoning_effort
                 )
@@ -934,18 +1082,20 @@ Rules:
                 # Extract JSON tolerantly
                 llm_json = self._extract_json_obj(llm_output)
                 if not llm_json:
+                    # Try to salvage just the pick id
+                    pick_only = self._extract_pick_from_text(llm_output)
+                    if pick_only is not None and pick_only in pruned_map:
+                        best_pick = pick_only
+                        break
                     raise ValueError("No valid JSON found in response")
                 
                 # Validate response
                 scores = llm_json.get("scores", {})
                 pick = llm_json.get("pick")
                 
-                # Check state hash (optional)
+                # Check state hash (soft warning only)
                 if llm_json.get("state_hash") != state_hash:
-                    print(f"Warning: state hash mismatch, using pre-scores fallback")
-                    # Use pre-scores argmax from pruned actions
-                    pick = max(pruned_pre_scores.items(), key=lambda x: float(x[1]))[0]
-                    pick = int(pick)
+                    print("Warning: rank state_hash mismatch")
                 
                 # Convert pick to int and validate
                 if pick is not None:
