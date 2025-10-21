@@ -36,6 +36,7 @@ from pokechamp.data_cache import (
     get_cached_pokemon_item_dict,
     get_cached_pokedex
 )
+import logging
 from pokechamp.minimax_optimizer import (
     get_minimax_optimizer,
     initialize_minimax_optimization,
@@ -49,14 +50,15 @@ from pokechamp.prompts import get_number_turns_faint, get_status_num_turns_fnt, 
 from pokechamp.gen1_quirks import Gen1Quirks
 
 
-DEBUG=False
+DEBUG = False
+logger = logging.getLogger(__name__)
 
 class LLMPlayer(Player):
     def __init__(self,
                  battle_format,
                  api_key="",
                  backend="gpt-4o",
-                 temperature=1.0,
+                 temperature=0.3,
                  prompt_algo="io",
                  log_dir=None,
                  team=None,
@@ -85,12 +87,29 @@ class LLMPlayer(Player):
         self._battle_last_action : Dict[AbstractBattle, Dict] = {}
         self.completion_tokens = 0
         self.prompt_tokens = 0
+        
+        # Momentum tracking per battle
+        self._momentum: Dict[str, Dict] = {}  # battle_tag -> momentum metrics
         self.backend = backend
         self.temperature = temperature
         self.log_dir = log_dir
         self.api_key = api_key
         self.prompt_algo = prompt_algo
         self.reasoning_effort = reasoning_effort
+        
+        # Two-tier temperature and token settings
+        # Tier 1: Action/Decision prompts (cold, structured JSON selection)
+        self.temp_action = 0.0        # For {"move": "X"} or {"switch": "Y"} - deterministic
+        self.mt_action = 16           # Minimal tokens for simple JSON
+        
+        # Tier 2: Expansion/Reasoning prompts (warmer, idea generation)
+        self.temp_expand = temperature  # Use CLI temperature for reasoning/brainstorming
+        self.mt_expand = max_tokens    # Use CLI max_tokens for expansion
+        
+        # Legacy compatibility - map to expand tier by default
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        
         self.gen = GenData.from_format(battle_format)
         self.genNum = self.gen.gen
         self.prompt_translate = prompt_translate
@@ -126,7 +145,8 @@ class LLMPlayer(Player):
                 # OpenRouter supports hundreds of models from various providers including xAI
                 self.llm = OpenRouterPlayer(self.api_key)
             elif 'gpt' in backend:
-                self.llm = GPTPlayer(self.api_key)
+                # Direct OpenAI API; allow service tier via env
+                self.llm = GPTPlayer(self.api_key, service_tier='priority')
             elif 'llama' == backend:
                 self.llm = LLAMAPlayer(device=device)
             elif 'gemini' in backend:
@@ -180,9 +200,11 @@ class LLMPlayer(Player):
             pass
         return None
 
-    def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None, reasoning_effort=None) -> str:
+    def get_LLM_action(self, system_prompt, user_prompt, model, temperature=None, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None, reasoning_effort=None) -> str:
         if reasoning_effort is None:
             reasoning_effort = self.reasoning_effort
+        if temperature is None:
+            temperature = self.temperature
         
         # Only pass reasoning_effort to GPTPlayer (supports it for o3-mini, o4-mini, gpt-5 models)
         llm_to_use = llm if llm is not None else self.llm
@@ -274,6 +296,43 @@ class LLMPlayer(Player):
             # Pokemon is trapped and cannot do anything - return default order
             print(f"Pokemon {battle.active_pokemon.species} is trapped and cannot move or switch")
             return self.choose_default_move()
+        
+        # Type-suicide guard: force switch if 2x weak and likely to die
+        if not battle.trapped and len(battle.available_switches) > 0:
+            try:
+                belief = self._get_belief_topk(battle, sim)
+                opp_topk = belief.get("opp_move_topk", [])
+                if opp_topk:
+                    top_move_id, top_prob = opp_topk[0]
+                    if top_prob > 0.35:
+                        top_move = Move(top_move_id, gen=sim.gen.gen)
+                        # Check if we're 2x weak to this move
+                        my_mult = battle.active_pokemon.damage_multiplier(top_move.type)
+                        if my_mult >= 2.0:
+                            # Estimate danger
+                            turns_opp_ko = get_number_turns_faint(
+                                battle.opponent_active_pokemon, top_move, battle.active_pokemon,
+                                sim, boosts1=battle.opponent_active_pokemon._boosts.copy(),
+                                boosts2=battle.active_pokemon._boosts.copy()
+                            )
+                            danger = 1.0 / max(1, turns_opp_ko)
+                            if danger > 0.6:  # Very likely to die
+                                # Check if we can KO back
+                                best_move, best_turns = self.estimate_matchup(sim, battle, battle.active_pokemon, battle.opponent_active_pokemon)
+                                if best_turns > 1:  # Can't OHKO back
+                                    # Force switch to best resist/immune
+                                    best_switch = None
+                                    best_resist = 999
+                                    for sw_mon in battle.available_switches:
+                                        resist = sw_mon.damage_multiplier(top_move.type)
+                                        if resist < best_resist:
+                                            best_resist = resist
+                                            best_switch = sw_mon
+                                    if best_switch and best_resist < 1.0:
+                                        print(f"Type-suicide guard: switching to {best_switch.species} (resists {top_move.id})")
+                                        return self.create_order(best_switch)
+            except Exception:
+                pass
         
         # Gen1 anti-wrap switch recommendation (only if not trapped)
         if sim.gen.gen == 1 and not battle.trapped and len(battle.available_switches) > 0:
@@ -376,8 +435,8 @@ class LLMPlayer(Player):
                     llm_output1 = self.get_LLM_action(system_prompt=system_prompt,
                                                user_prompt=state_prompt_tot_1,
                                                model=self.backend,
-                                               temperature=self.temperature,
-                                               max_tokens=200,
+                                               temperature=self.temp_expand,
+                                               max_tokens=self.mt_expand,
                                                json_format=True)
                     break
                 except:
@@ -392,8 +451,8 @@ class LLMPlayer(Player):
                     llm_output2 = self.get_LLM_action(system_prompt=system_prompt,
                                                user_prompt=state_prompt_tot_2.replace("[OPTIONS]", llm_output1),
                                                model=self.backend,
-                                               temperature=self.temperature,
-                                               max_tokens=100,
+                                               temperature=self.temp_expand,
+                                               max_tokens=self.mt_expand,
                                                json_format=True)
 
                     next_action = self.parse_new(llm_output2, battle, sim)
@@ -416,55 +475,55 @@ class LLMPlayer(Player):
             return next_action
 
         elif self.prompt_algo == "minimax":
-            # Use original LLM-based minimax implementation with timeout protection
             start_time = time.time()
+
+            if not self._ensure_minimax_ready(battle):
+                logger.warning("Minimax optimizer disabled, falling back to damage calculator")
+                return self._minimax_fallback(battle, start_time, reason='minimax_not_ready')
+
             try:
-                action = self.tree_search_optimized(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim)
-                
-                # Record metrics
-                progress_score = self._record_progress(battle)
-                elapsed = time.time() - start_time
-                self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
-                                    action_kind='minimax', action_label=str(action.message if hasattr(action, 'message') else action.order), 
-                                    max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
-                                    near_timeout=(elapsed > self.move_time_limit_s - 2.0), progress_score=progress_score)
-                return action
-                
-            except Exception as e:
-                print(f'Minimax failed ({e}). Using fallback')
-                # Fallback to damage calculator
-                move, _ = self.dmg_calc_move(battle)
-                if move is not None:
-                    progress_score = self._record_progress(battle)
-                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_exception', 
-                                        action_kind='move', action_label=str(getattr(move, 'order', '')), 
-                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
-                                        near_timeout=False, progress_score=progress_score)
-                    return move
-                # Last resort
-                progress_score = self._record_progress(battle)
-                self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_exception_maxdmg', 
-                                    action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
-                                    tokens_prompt=0, tokens_completion=0, near_timeout=False, 
-                                    progress_score=progress_score)
-                return self.choose_max_damage_move(battle)
+                action = self.tree_search_optimized(
+                    retries, battle, sim=sim, return_opp=False, start_time=start_time
+                )
+            except RuntimeError as exc:
+                logger.warning("Minimax runtime error: %s", exc)
+                return self._minimax_fallback(battle, start_time, reason='minimax_runtime_error')
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Unexpected minimax failure")
+                return self._minimax_fallback(battle, start_time, reason='minimax_exception')
+
+            progress_score = self._record_progress(battle)
+            elapsed = time.time() - start_time
+            self._record_metric(
+                battle,
+                start_time,
+                json_ok=True,
+                fallback_reason='',
+                action_kind='minimax',
+                action_label=str(action.message if hasattr(action, 'message') else action.order),
+                max_tokens=self.max_tokens,
+                tokens_prompt=0,
+                tokens_completion=0,
+                near_timeout=(elapsed > self.move_time_limit_s - 2.0),
+                progress_score=progress_score,
+            )
+            return action
 
         
     def _init_metrics_file(self):
         if not self.log_dir:
             return
-        try:
-            os.makedirs(self.log_dir, exist_ok=True)
-            path = os.path.join(self.log_dir, 'metrics.csv')
-            if not os.path.exists(path):
-                with open(path, 'w') as f:
-                    f.write('battle_tag,turn,backend,latency_ms,json_ok,'
-                            'fallback_reason,available_moves,available_switches,'
-                            'action_kind,action_label,max_tokens,tokens_prompt,tokens_completion,'
-                            'near_timeout,progress_score\n')
-            self._metrics_file_initialized = True
-        except Exception:
-            pass
+        os.makedirs(self.log_dir, exist_ok=True)
+        path = os.path.join(self.log_dir, 'metrics.csv')
+        if not os.path.exists(path):
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(
+                    'battle_tag,turn,backend,algorithm,latency_ms,json_ok,'
+                    'fallback_reason,available_moves,available_switches,'
+                    'action_kind,action_label,max_tokens,tokens_prompt,tokens_completion,'
+                    'near_timeout,progress_score\n'
+                )
+        self._metrics_file_initialized = True
 
     def _record_metric(self, battle: Battle, start_time: float, json_ok: bool, fallback_reason: str, action_kind: str, action_label: str, max_tokens: int, tokens_prompt: int, tokens_completion: int, near_timeout: bool, progress_score: int):
         latency_ms = int((max(0.0, time.time() - start_time)) * 1000)
@@ -474,6 +533,7 @@ class LLMPlayer(Player):
             getattr(battle, 'battle_tag', ''),
             getattr(battle, 'turn', 0),
             self.backend,
+            self.prompt_algo,  # Add algorithm to the log
             latency_ms,
             int(bool(json_ok)),
             fallback_reason,
@@ -532,8 +592,17 @@ class LLMPlayer(Player):
         moves = [r for r in self._move_metrics if r[0] == bt]
         if not moves:
             return
-        latencies = [r[3] for r in moves]
-        avg_ms = sum(latencies) / len(latencies)
+        # Latency is now at index 4 (after battle_tag, turn, backend, algorithm)
+        # Use try-except to handle both old format (index 3) and new format (index 4)
+        try:
+            latencies = [int(r[4]) for r in moves]
+        except (IndexError, ValueError):
+            # Fallback for old format or corrupted data
+            try:
+                latencies = [int(r[3]) for r in moves]
+            except (IndexError, ValueError):
+                latencies = [0]
+        avg_ms = sum(latencies) / len(latencies) if latencies else 0
         llm_calls = sum(self._llm_calls_per_turn.get(bt, {}).values()) if bt in self._llm_calls_per_turn else 0
         timeouts = self._timeouts.get(bt, 0)
         avoided = self._timeout_avoided.get(bt, 0)
@@ -810,14 +879,74 @@ class LLMPlayer(Player):
             # Fallback to simple tag-turn string if anything goes wrong
             return f"{battle.battle_tag}-{battle.turn}"
 
+    def _update_momentum(self, battle: AbstractBattle):
+        """Update momentum metrics for the battle."""
+        tag = battle.battle_tag
+        if tag not in self._momentum:
+            self._momentum[tag] = {
+                "last_switch_turn": 0,
+                "my_switch_count": 0,
+                "opp_switch_count": 0,
+                "damage_history": [],  # (turn, net_damage)
+                "last_actions": []  # Recent action strings for oscillation detection
+            }
+        
+        mom = self._momentum[tag]
+        
+        # Track switches (simplified - would need message parsing for accuracy)
+        # Increment counts based on battle events (placeholder logic)
+        
+        # Track damage (net damage last turn)
+        try:
+            my_hp_lost = 1.0 - getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
+            opp_hp_lost = 1.0 - getattr(battle.opponent_active_pokemon, 'current_hp_fraction', 1.0)
+            net_dmg = opp_hp_lost - my_hp_lost
+            mom["damage_history"].append((battle.turn, net_dmg))
+            # Keep only last 5 turns
+            mom["damage_history"] = mom["damage_history"][-5:]
+        except Exception:
+            pass
+
+    def _get_momentum(self, battle: AbstractBattle) -> Dict[str, Any]:
+        """Get momentum metrics."""
+        tag = battle.battle_tag
+        if tag not in self._momentum:
+            self._update_momentum(battle)
+        
+        mom = self._momentum[tag]
+        
+        # Calculate net chip last 3 turns
+        try:
+            recent = [d for t, d in mom["damage_history"] if battle.turn - t <= 3]
+            net_chip_last3 = sum(recent) * 100 if recent else 0.0
+        except Exception:
+            net_chip_last3 = 0.0
+        
+        # Status advantage
+        try:
+            my_status_count = sum(1 for mon in battle.team.values() if getattr(mon, 'status', None) is not None)
+            opp_status_count = sum(1 for mon in battle.opponent_team.values() if getattr(mon, 'status', None) is not None)
+            status_adv = opp_status_count - my_status_count
+        except Exception:
+            status_adv = 0
+        
+        # Switch delta
+        switch_delta = mom.get("opp_switch_count", 0) - mom.get("my_switch_count", 0)
+        
+        # Oscillation detection (simplified)
+        oscillation_flag = len(mom.get("last_actions", [])) >= 4 and len(set(mom["last_actions"][-4:])) <= 2
+        
+        return {
+            "pp_adv": 0,  # TODO: needs PP tracking
+            "status_adv": status_adv,
+            "net_chip_last3": round(net_chip_last3, 1),
+            "switch_delta": switch_delta,
+            "oscillation_flag": oscillation_flag
+        }
+
     def _get_progress_score(self, battle: AbstractBattle) -> Dict[str, float]:
         """Get current progress metrics."""
-        # TODO: Implement proper PP advantage, status advantage, chip damage tracking
-        return {
-            "pp_adv": 0.0,  # Placeholder
-            "status_adv": 1.0 if battle.opponent_active_pokemon.status else 0.0,
-            "net_chip_last3": 0.0  # Placeholder
-        }
+        return self._get_momentum(battle)
 
     def _get_budget_class(self) -> str:
         """Rough budget class from configured move time limit.
@@ -833,8 +962,147 @@ class LLMPlayer(Player):
             return "C1"
         return "C0"
 
-    def _prune_candidates(self, battle: AbstractBattle, actions: List[Dict], pre_scores: Dict[str, float], max_actions: int = 4) -> List[Dict]:
-        """Smart pruning to keep diverse action types."""
+    def _is_para_immune(self, opponent: Pokemon, move_id: str) -> bool:
+        """Gen1: Thunder Wave fails on Ground; treat Electric as immune for safety."""
+        if move_id != "thunderwave":
+            return False
+        t1 = getattr(opponent, 'type_1', None)
+        t2 = getattr(opponent, 'type_2', None)
+        names = set()
+        if t1: names.add(t1.name.upper())
+        if t2: names.add(t2.name.upper())
+        return ("GROUND" in names) or ("ELECTRIC" in names)
+
+    def _is_powder_immune(self, opponent: Pokemon, move_id: str) -> bool:
+        """Conservative: treat Grass as immune to Sleep/Paralysis powders."""
+        if move_id not in {"sleeppowder", "stunspore"}:
+            return False
+        t1 = getattr(opponent, 'type_1', None)
+        t2 = getattr(opponent, 'type_2', None)
+        names = set()
+        if t1: names.add(t1.name.upper())
+        if t2: names.add(t2.name.upper())
+        return "GRASS" in names
+
+    def _get_phase(self, battle: AbstractBattle) -> str:
+        """Determine battle phase: opening, mid, or endgame."""
+        try:
+            my_alive = sum(1 for mon in battle.team.values() if not getattr(mon, 'fainted', False))
+            opp_alive = sum(1 for mon in battle.opponent_team.values() if not getattr(mon, 'fainted', False))
+            total_hp_frac = sum(getattr(mon, 'current_hp_fraction', 0.0) for mon in battle.team.values() if not getattr(mon, 'fainted', False))
+            total_hp_frac += sum(getattr(mon, 'current_hp_fraction', 0.0) for mon in battle.opponent_team.values() if not getattr(mon, 'fainted', False))
+        except Exception:
+            my_alive, opp_alive, total_hp_frac = 6, 6, 10.0
+        
+        if battle.turn <= 5 and my_alive >= 5 and opp_alive >= 5:
+            return "opening"
+        elif my_alive <= 2 or opp_alive <= 2 or total_hp_frac <= 3.5:
+            return "endgame"
+        else:
+            return "mid"
+
+    def _get_endgame_flags(self, battle: AbstractBattle) -> Dict[str, Any]:
+        """Compute endgame indicators."""
+        try:
+            my_alive = sum(1 for mon in battle.team.values() if not getattr(mon, 'fainted', False))
+            opp_alive = sum(1 for mon in battle.opponent_team.values() if not getattr(mon, 'fainted', False))
+        except Exception:
+            my_alive, opp_alive = 6, 6
+        return {
+            "is_endgame": (my_alive <= 2 or opp_alive <= 2),
+            "my_alive": my_alive,
+            "opp_alive": opp_alive,
+        }
+
+    def _get_belief_topk(self, battle: AbstractBattle, sim) -> Dict[str, List]:
+        """Get Bayesian predictor top-K opponent moves and switches."""
+        try:
+            opp_moves_str = sim.get_opponent_current_moves(mon=battle.opponent_active_pokemon)
+            if not isinstance(opp_moves_str, list):
+                opp_moves_str = list(opp_moves_str) if opp_moves_str else []
+            opp_moves_topk = [(m, 1.0 / len(opp_moves_str)) for m in opp_moves_str[:3]]
+        except Exception:
+            opp_moves_topk = []
+
+        try:
+            opp_switches = [mon.species for mon in battle.opponent_team.values() 
+                          if not getattr(mon, 'fainted', False) and not getattr(mon, 'active', False)]
+            opp_switch_topk = [(s, 1.0 / len(opp_switches)) for s in opp_switches[:2]]
+        except Exception:
+            opp_switch_topk = []
+
+        return {"opp_move_topk": opp_moves_topk, "opp_switch_topk": opp_switch_topk}
+
+    def _belief_mix_score(self, action: Dict, belief: Dict, sim, battle: AbstractBattle) -> float:
+        """Compute pure belief-mixed expected value over opponent responses."""
+        # Use the improved implementation with fixed parameters
+        from pokechamp.rank_improvements_v3_simple import compute_belief_mixed_ev
+        return compute_belief_mixed_ev(battle, action, belief, sim)
+
+    def _microsearch_pick(self, pruned_actions: List[Dict], sim, battle, belief: Dict) -> Optional[int]:
+        """Two-ply micro-search with proper opponent modeling."""
+        # Import the improved implementation
+        from pokechamp.rank_improvements_v3_simple import microsearch_two_ply
+        
+        best_score = -1e9
+        best_id = None
+        
+        for action in pruned_actions:
+            score = microsearch_two_ply(battle, action, belief, sim)
+            if score > best_score:
+                best_score = score
+                best_id = action["id"]
+                
+        return best_id
+
+    def _categorize_move(self, move: Move) -> str:
+        """Categorize move for diversity in pruning."""
+        if move.category != MoveCategory.STATUS:
+            if move.base_power and move.base_power >= 100:
+                return "nuke"
+            else:
+                return "chip"
+        else:
+            mv_id = move.id
+            sleep_moves = {"spore", "sleeppowder", "hypnosis", "sing", "lovelykiss"}
+            para_moves = {"thunderwave", "stunspore", "glare"}
+            healing_moves = {"softboiled", "recover", "rest", "milkdrink", "synthesis", "moonlight", "morningsun"}
+            if mv_id in sleep_moves:
+                return "sleep"
+            elif mv_id in para_moves:
+                return "para"
+            elif mv_id in healing_moves:
+                return "heal"
+            else:
+                return "setup"
+
+    def _prune_candidates(self, battle: AbstractBattle, actions: List[Dict], pre_scores: Dict[str, float], max_actions: int = 4, sim=None) -> List[Dict]:
+        """Smart pruning with dominance filtering and diversity."""
+        from pokechamp.rank_improvements_v3_simple import dominance_filter
+        
+        # First, apply dominance filtering if we have belief data
+        try:
+            belief = self._get_belief_topk(battle, sim) if sim else {}
+            if belief and (belief.get("opp_move_topk") or belief.get("opp_switch_topk")):
+                # Build EV matrix for dominance checking
+                ev_matrix = {}
+                for action in actions:
+                    action_id = action["id"]
+                    ev_matrix[action_id] = {}
+                    
+                    # Compute EV against each opponent response
+                    for opp_move_id, _ in belief.get("opp_move_topk", [])[:3]:
+                        # Simplified - use pre-score as proxy for EV
+                        ev_matrix[action_id][f"move_{opp_move_id}"] = pre_scores.get(str(action_id), 0.0)
+                    
+                    for opp_switch, _ in belief.get("opp_switch_topk", [])[:2]:
+                        ev_matrix[action_id][f"switch_{opp_switch}"] = pre_scores.get(str(action_id), 0.0)
+                
+                # Apply dominance filter
+                actions = dominance_filter(actions, ev_matrix)
+        except Exception:
+            pass  # Skip dominance filtering on error
+        
         # Separate moves and switches
         moves = [(a, float(pre_scores.get(str(a["id"]), 0.0))) for a in actions if a["type"] in ["move", "dynamax", "terastallize"]]
         switches = [(a, float(pre_scores.get(str(a["id"]), 0.0))) for a in actions if a["type"] == "switch"]
@@ -858,7 +1126,47 @@ class LLMPlayer(Player):
                 if mv in para_moves and opp_status is not None:
                     # Skip paralysis attempts if opponent already has a status
                     continue
+                if mv in para_moves:
+                    opp = getattr(battle, 'opponent_active_pokemon', None)
+                    if opp is not None and self._is_para_immune(opp, mv):
+                        continue
+                if mv in {"sleeppowder", "stunspore"}:
+                    opp = getattr(battle, 'opponent_active_pokemon', None)
+                    if opp is not None and self._is_powder_immune(opp, mv):
+                        continue
             filtered_moves.append((a, v))
+
+        # Enforce diversity: at least one status move if it's good
+        if sim is not None and len(filtered_moves) > 0:
+            categories = {}
+            for a, v in filtered_moves:
+                try:
+                    mv = Move(a["move"], gen=sim.gen.gen)
+                    cat = self._categorize_move(mv)
+                    if cat not in categories or v > categories[cat][1]:
+                        categories[cat] = (a, v)
+                except Exception:
+                    pass
+            # If we have a good status move and no status in top, force include it
+            has_status_in_top = False
+            for a, _ in filtered_moves[:max_actions-1]:
+                try:
+                    mv = Move(a["move"], gen=sim.gen.gen)
+                    if self._categorize_move(mv) in ["sleep", "para", "setup"]:
+                        has_status_in_top = True
+                        break
+                except Exception:
+                    pass
+            if not has_status_in_top:
+                for cat in ["sleep", "para", "setup"]:
+                    if cat in categories and categories[cat][1] >= 0.3:
+                        # Force include this status move
+                        filtered_moves = [categories[cat]] + [x for x in filtered_moves if x[0]["id"] != categories[cat][0]["id"]]
+                        break
+
+        # Sort by score
+        filtered_moves.sort(key=lambda x: x[1], reverse=True)
+        switches.sort(key=lambda x: x[1], reverse=True)
 
         # Take top moves and best switch
         pruned = [a for a, _ in filtered_moves[:max_actions-1]]
@@ -922,90 +1230,68 @@ class LLMPlayer(Player):
         if not legal_actions:
             return self.choose_default_move()
         
+        # Get endgame and belief context
+        endgame = self._get_endgame_flags(battle)
+        belief = self._get_belief_topk(battle, sim)
+
         # Calculate opponent danger once (estimated turns for opponent to KO us)
         try:
             _, opp_turns_to_ko = self.estimate_matchup(sim, battle, battle.opponent_active_pokemon, battle.active_pokemon, is_opp=True)
         except Exception:
             opp_turns_to_ko = np.inf
 
-        # Calculate pre-scores using damage calculator for moves
+        # Calculate pre-scores using pure belief-mixed EV
         pre_scores = {}
+        from pokechamp.rank_improvements_v3_simple import explosion_gate
+        
         for action in legal_actions:
-            if action["type"] in ["move", "dynamax", "terastallize"]:
-                # Quick damage estimate
-                move_name = action["move"]
-                try:
-                    move = Move(move_name, gen=sim.gen.gen)
-                    hp_frac = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
-                    if move.category != MoveCategory.STATUS:
-                        # Use turns to faint as inverse pre-score
-                        turns = get_number_turns_faint(battle.active_pokemon, move, battle.opponent_active_pokemon, 
-                                                     sim, boosts1=battle.active_pokemon._boosts.copy(), 
-                                                     boosts2=battle.opponent_active_pokemon._boosts.copy())
-                        # Convert turns to score (1 turn = 1.0, 2 turns = 0.5, etc.)
-                        pre_score = min(1.0, 1.0 / max(1, turns))
-                        # If KO this turn, strongly prefer
-                        if turns <= 1:
-                            pre_score = 1.0
-                        # Explode only if KO or dying anyway (trade up)
-                        sd_moves = {"selfdestruct", "explosion"}
-                        if move.id in sd_moves:
-                            my_hp = getattr(battle.active_pokemon, 'current_hp_fraction', 1.0)
-                            # Compute alive counts to spot endgame
-                            try:
-                                my_alive = sum(1 for mon in battle.team.values() if not getattr(mon, 'fainted', False))
-                                opp_alive = sum(1 for mon in battle.opponent_team.values() if not getattr(mon, 'fainted', False))
-                            except Exception:
-                                my_alive, opp_alive = 6, 6
-                            endgame = (my_alive <= 2 or opp_alive <= 2)
-                            explode_ok = (turns <= 1) or ((opp_turns_to_ko is not None and opp_turns_to_ko <= 1) and my_hp <= 0.35) or endgame
-                            if not explode_ok:
-                                pre_score = 0.0
-                    else:
-                        # Status/progress moves – contextual
-                        pre_score = 0.2
-                        mv_id = move.id
-                        healing_moves = {"softboiled", "recover", "rest", "milkdrink", "synthesis", "moonlight", "morningsun"}
-                        sleep_moves = {"spore", "sleeppowder", "hypnosis", "sing", "lovelykiss"}
-                        para_moves = {"thunderwave", "stunspore", "glare"}
-                        reflect_like = {"reflect", "lightscreen"}
-                        opp_status = getattr(battle.opponent_active_pokemon, 'status', None)
-
-                        # Healing: only valuable when low HP or in immediate danger
-                        if mv_id in healing_moves:
-                            if hp_frac >= 0.9 and (opp_turns_to_ko is None or opp_turns_to_ko > 1):
-                                pre_score = 0.0
-                            elif hp_frac <= 0.35 or (opp_turns_to_ko is not None and opp_turns_to_ko <= 1):
-                                pre_score = 0.6
-                            else:
-                                pre_score = 0.35
-                        elif mv_id in sleep_moves:
-                            # Strong progress in Gen1 if clause not already used; we lack tracking so give moderate
-                            pre_score = 0.55
-                        elif mv_id in para_moves:
-                            # Don't paralyze if already statused
-                            pre_score = 0.0 if opp_status is not None else 0.45
-                        elif mv_id in reflect_like:
-                            # Useful vs physical threats
-                            pre_score = 0.35
-                    
-                    # Apply Gen1 quirks if applicable
-                    if sim.gen.gen == 1:
+            try:
+                # Check explosion gate
+                if action["type"] in ["move", "dynamax", "terastallize"]:
+                    if not explosion_gate(action, battle, belief, sim):
+                        pre_scores[str(action["id"])] = 0.0
+                        continue
+                
+                # Compute pure belief-mixed expected value
+                pre_score = self._belief_mix_score(action, belief, sim, battle)
+                
+                # Apply Gen1 quirks if applicable
+                if sim.gen.gen == 1 and action["type"] in ["move", "dynamax", "terastallize"]:
+                    try:
+                        move = Move(action["move"], gen=sim.gen.gen)
                         pre_score = Gen1Quirks.adjust_move_value(
                             move, battle.active_pokemon, battle.opponent_active_pokemon,
                             battle, pre_score
                         )
-                except:
-                    pre_score = 0.2
-                pre_scores[str(action["id"])] = round(pre_score, 2)
-            else:
-                # Switches get lower pre-score
+                    except:
+                        pass
+                
+                # Don't round or clip - preserve margins
+                pre_scores[str(action["id"])] = pre_score
+            except Exception as e:
+                # Fallback for errors
                 pre_scores[str(action["id"])] = 0.15
         
-        # Budget-aware pruning: <=4 in C0, <=6 in C1/C2
+        # Budget-aware pruning with dynamic adjustment based on danger/margin
         budget_class = self._get_budget_class()
-        max_actions = 4 if budget_class == "C0" else 6
-        pruned_actions = self._prune_candidates(battle, legal_actions, pre_scores, max_actions=max_actions)
+        base_max = 4 if budget_class == "C0" else 6
+        
+        # Temporarily calculate margin for pruning decision
+        temp_sorted = sorted(pre_scores.values(), reverse=True)
+        temp_margin = temp_sorted[0] - (temp_sorted[1] if len(temp_sorted) > 1 else 0.0)
+        temp_danger = 1.0 / max(1, opp_turns_to_ko) if opp_turns_to_ko != np.inf else 0.0
+        
+        # Adjust pruning based on situation
+        if temp_margin > 0.5 and temp_danger < 0.3:
+            # Clear decision, low danger - prune harder
+            max_actions = max(3, base_max - 1)
+        elif temp_margin < 0.1 and temp_danger > 0.5:
+            # Tight decision, high danger - allow more options
+            max_actions = min(8, base_max + 1)
+        else:
+            max_actions = base_max
+            
+        pruned_actions = self._prune_candidates(battle, legal_actions, pre_scores, max_actions=max_actions, sim=sim)
 
         # Reindex pruned actions 0..N-1 for a cleaner contract
         reindexed_actions = []
@@ -1027,27 +1313,69 @@ class LLMPlayer(Player):
         freeze_count = sum(1 for mon in battle.opponent_team.values() 
                           if mon.status == Status.FRZ and not mon.fainted)
         
-        # Filter pre-scores to only pruned actions (reindexed)
+        # Update momentum before building context
+        self._update_momentum(battle)
+        
+        # Get all context components
+        phase = self._get_phase(battle)
+        momentum = self._get_momentum(battle)
+        
+        # Calculate danger using proper KO probability
+        from pokechamp.rank_improvements_v3_simple import compute_ko_probability
+        danger_next_turn = 0.0
+        
+        # Compute danger from opponent's top move
+        opp_topk = belief.get("opp_move_topk", [])
+        if opp_topk:
+            try:
+                opp_move_id, opp_move_prob = opp_topk[0]
+                opp_move = Move(opp_move_id, gen=sim.gen.gen)
+                ko_prob = compute_ko_probability(battle.opponent_active_pokemon, opp_move, battle.active_pokemon, sim)
+                danger_next_turn = ko_prob * opp_move_prob
+            except Exception:
+                # Fallback to simple calculation
+                danger_next_turn = 1.0 / max(1, opp_turns_to_ko) if opp_turns_to_ko != np.inf else 0.0
+        else:
+            # No belief, use simple calculation
+            danger_next_turn = 1.0 / max(1, opp_turns_to_ko) if opp_turns_to_ko != np.inf else 0.0
+            
+        sorted_pre = sorted(pre_scores.values(), reverse=True)
+        q_margin = sorted_pre[0] - (sorted_pre[1] if len(sorted_pre) > 1 else 0.0)
+        
+        # Filter pre-scores to only pruned actions (reindexed) - preserve margins!
         pruned_pre_scores = {str(a["id"]): pre_scores.get(str(reindex_map[a["id"]]), 0.0) for a in pruned_actions}
 
-        # Pure JSON user payload per spec
+        # Rich JSON user payload per spec
         user_ctx = {
-            "version": "ctx-1.2",
+            "version": "ctx-1.3",
             "format": getattr(self, "format", "gen9ou"),
             "turn": battle.turn,
             "state_hash": state_hash,
+            "phase": phase,
+            "endgame": endgame["is_endgame"],
             "mechanics": {
                 "tera": False,
                 "sleep_clause": True,
                 "freeze_clause": True,
                 "partial_trap_active": bool(getattr(battle, "trapped", False)),
+                "reflect_active": False,  # TODO: track from battle events
+                "lightscreen_active": False,
             },
             "clause_state": {
-                "sleep_clause_used_by_me": False,
-                "freeze_clause_engaged": False,
+                "sleep_clause_used_by_me": sleep_count >= 1,
+                "freeze_clause_engaged": freeze_count >= 1,
+            },
+            "belief": {
+                "opp_move_topk": belief.get("opp_move_topk", [])[:3],
+                "opp_switch_topk": belief.get("opp_switch_topk", [])[:2],
+                "entropy": 0.0,  # TODO: compute entropy from belief distribution
+            },
+            "momentum": momentum,
+            "risk": {
+                "danger_next_turn": round(danger_next_turn, 2),
+                "q_margin": round(q_margin, 2),
             },
             "budget_class": budget_class,
-            "progress_score": self._get_progress_score(battle),
             "legal_actions": pruned_actions,
             "pre_scores": pruned_pre_scores,
             "request": "rank_actions_by_winprob",
@@ -1064,6 +1392,7 @@ class LLMPlayer(Player):
         
         # Single LLM call
         best_pick = None
+        model_scores: Dict[int, float] = {}
         for i in range(retries):
             try:
                 # TODO: make temp and max_tokens a parameter, and/or add to the documentation
@@ -1082,11 +1411,6 @@ class LLMPlayer(Player):
                 # Extract JSON tolerantly
                 llm_json = self._extract_json_obj(llm_output)
                 if not llm_json:
-                    # Try to salvage just the pick id
-                    pick_only = self._extract_pick_from_text(llm_output)
-                    if pick_only is not None and pick_only in pruned_map:
-                        best_pick = pick_only
-                        break
                     raise ValueError("No valid JSON found in response")
                 
                 # Validate response
@@ -1097,18 +1421,35 @@ class LLMPlayer(Player):
                 if llm_json.get("state_hash") != state_hash:
                     print("Warning: rank state_hash mismatch")
                 
-                # Convert pick to int and validate
+                # Priority 1: Use the explicit pick if valid
                 if pick is not None:
-                    pick = int(pick)
-                    if pick in pruned_map:
-                        best_pick = pick
-                        break
+                    try:
+                        pick = int(pick)
+                        if pick in pruned_map:
+                            best_pick = pick
+                            # Also extract scores for micro-search
+                            if scores:
+                                model_scores = {int(k): float(v) for k, v in scores.items() if int(k) in pruned_map}
+                            break
+                    except:
+                        pass
                 
-                # Fallback to best scored action
+                # Priority 2: Use scores argmax
                 if scores:
-                    valid_scores = {int(k): float(v) for k, v in scores.items() if int(k) in pruned_map}
-                    if valid_scores:
-                        best_pick = max(valid_scores.items(), key=lambda x: x[1])[0]
+                    try:
+                        valid_scores = {int(k): float(v) for k, v in scores.items() if int(k) in pruned_map}
+                        if valid_scores:
+                            best_pick = max(valid_scores.items(), key=lambda x: x[1])[0]
+                            model_scores = valid_scores
+                            break
+                    except:
+                        pass
+                
+                # Priority 3: Last resort - try text extraction (avoid if possible)
+                if not best_pick:
+                    pick_only = self._extract_pick_from_text(llm_output)
+                    if pick_only is not None and pick_only in pruned_map:
+                        best_pick = pick_only
                         break
                 
             except Exception as e:
@@ -1120,6 +1461,18 @@ class LLMPlayer(Player):
         
         # Use the pick if we got one
         if best_pick is not None and best_pick in pruned_map:
+            # Optional micro-search when margin small, danger high, and budget allows
+            try:
+                if model_scores and budget_class in ["C1", "C2"]:
+                    sorted_scores = sorted(model_scores.values(), reverse=True)
+                    margin = sorted_scores[0] - (sorted_scores[1] if len(sorted_scores) > 1 else 0.0)
+                    # Only trigger on very tight margins AND high danger
+                    if margin < 0.02 and danger_next_turn > 0.5:
+                        ms_pick = self._microsearch_pick(pruned_actions, sim, battle, belief)
+                        if ms_pick is not None and ms_pick in pruned_map:
+                            best_pick = ms_pick
+            except Exception:
+                pass
             # Record metrics
             elapsed = time.time() - start_time
             near_timeout = elapsed > (self.move_time_limit_s * 0.8)
@@ -1351,46 +1704,91 @@ class LLMPlayer(Player):
                 player_remaining, opp_remaining,
                 battle_state.turn
             )
-        except:
+        except Exception:  # noqa: BLE001
             # Ultimate fallback to basic hp difference
             try:
                 from poke_env.player.local_simulation import LocalSim
-                sim = LocalSim(battle_state, 
-                            self.move_effect,
-                            self.pokemon_move_dict,
-                            self.ability_effect,
-                            self.pokemon_ability_dict,
-                            self.item_effect,
-                            self.pokemon_item_dict,
-                            self.gen,
-                            self._dynamax_disable,
-                            format=self.format
+
+                sim = LocalSim(
+                    battle_state,
+                    self.move_effect,
+                    self.pokemon_move_dict,
+                    self.ability_effect,
+                    self.pokemon_ability_dict,
+                    self.item_effect,
+                    self.pokemon_item_dict,
+                    self.gen,
+                    self._dynamax_disable,
+                    format=self.format,
                 )
                 return sim.get_hp_diff()
-            except:
+            except Exception:  # noqa: BLE001
                 return 50  # Neutral fallback score
     
     def _initialize_minimax_optimizer(self, battle):
         """Initialize the minimax optimizer with current battle state."""
-        try:
-            initialize_minimax_optimization(
-                battle=battle,
-                move_effect=self.move_effect,
-                pokemon_move_dict=self.pokemon_move_dict,
-                ability_effect=self.ability_effect,
-                pokemon_ability_dict=self.pokemon_ability_dict,
-                item_effect=self.item_effect,
-                pokemon_item_dict=self.pokemon_item_dict,
-                gen=self.gen,
-                _dynamax_disable=self._dynamax_disable,
-                format=self.format,
-                prompt_translate=self.prompt_translate
+        initialize_minimax_optimization(
+            battle=battle,
+            move_effect=self.move_effect,
+            pokemon_move_dict=self.pokemon_move_dict,
+            ability_effect=self.ability_effect,
+            pokemon_ability_dict=self.pokemon_ability_dict,
+            item_effect=self.item_effect,
+            pokemon_item_dict=self.pokemon_item_dict,
+            gen=self.gen,
+            _dynamax_disable=self._dynamax_disable,
+            format=self.format,
+            prompt_translate=self.prompt_translate
+        )
+        self._minimax_initialized = True
+        logger.info("Minimax optimizer initialized")
+
+    def _ensure_minimax_ready(self, battle) -> bool:
+        if not self.use_optimized_minimax:
+            return False
+        if not self._minimax_initialized:
+            try:
+                self._initialize_minimax_optimizer(battle)
+            except Exception as exc:
+                logger.warning("Failed to initialize minimax optimizer: %s", exc)
+                self.use_optimized_minimax = False
+                return False
+        return self.use_optimized_minimax
+
+    def _minimax_fallback(self, battle, start_time, reason: str):
+        move, _ = self.dmg_calc_move(battle)
+        progress_score = self._record_progress(battle)
+        if move is not None:
+            self._record_metric(
+                battle,
+                start_time,
+                json_ok=False,
+                fallback_reason=reason,
+                action_kind='move',
+                action_label=str(getattr(move, 'order', '')),
+                max_tokens=self.max_tokens,
+                tokens_prompt=0,
+                tokens_completion=0,
+                near_timeout=False,
+                progress_score=progress_score,
             )
-            self._minimax_initialized = True
-            print("🚀 Minimax optimizer initialized")
-        except Exception as e:
-            print(f"⚠️  Failed to initialize minimax optimizer: {e}")
-            self.use_optimized_minimax = False  # Fallback to original
+            return move
+
+        max_damage_action = self.choose_max_damage_move(battle)
+        self._record_metric(
+            battle,
+            start_time,
+            json_ok=False,
+            fallback_reason=f'{reason}_maxdmg',
+            action_kind='max_damage',
+            action_label=str(getattr(max_damage_action, 'order', '')),
+            max_tokens=self.max_tokens,
+            tokens_prompt=0,
+            tokens_completion=0,
+            near_timeout=False,
+            progress_score=progress_score,
+        )
+        return max_damage_action
 
     def check_timeout(self, start_time, battle):
         if time.time() - start_time > 30:
@@ -1486,8 +1884,8 @@ class LLMPlayer(Player):
                     llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                                     user_prompt=state_prompt_io,
                                                     model=self.backend,
-                                                    temperature=self.temperature,
-                                                    max_tokens=500,
+                                                    temperature=self.temp_expand,
+                                                    max_tokens=self.mt_expand,
                                                     json_format=True,
                                                     llm=self.llm_value
                                                     )
@@ -1547,11 +1945,12 @@ class LLMPlayer(Player):
                                 {"choice":"damage calculator"} or {"choice":"minimax"}'''
 
                             state_prompt_io = state_prompt + tool_prompt
+                            # Use action-tier settings for structured JSON selection
                             llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                                             user_prompt=state_prompt_io,
                                                             model=self.backend,
-                                                            temperature=0.6,
-                                                            max_tokens=100,
+                                                            temperature=self.temp_action,
+                                                            max_tokens=self.mt_action,
                                                             json_format=True,
                                                             )
                             # load when llm does heavylifting for parsing
@@ -1707,11 +2106,8 @@ class LLMPlayer(Player):
             start_time = time.time()
         internal_start = time.time()
         
+        root = optimizer.create_optimized_root(battle)
         try:
-            # Create optimized root node
-            root = optimizer.create_optimized_root(battle)
-            
-            # Get battle state information for LLM decision
             system_prompt, state_prompt, _, _, _, _, _ = root.simulation.get_player_prompt(return_actions=True)
             
             # Ask LLM upfront whether to use minimax or damage calculator
@@ -1749,11 +2145,12 @@ class LLMPlayer(Player):
                         {"choice":"damage calculator"} or {"choice":"minimax"}'''
 
                         state_prompt_io = state_prompt + tool_prompt
+                        # Use action-tier settings for structured JSON selection
                         llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                                         user_prompt=state_prompt_io,
                                                         model=self.backend,
-                                                        temperature=0.6,
-                                                        max_tokens=100,
+                                                        temperature=self.temp_action,
+                                                        max_tokens=self.mt_action,
                                                         json_format=True,
                                                         )
                         # Load when llm does heavylifting for parsing
@@ -1839,8 +2236,8 @@ class LLMPlayer(Player):
                         llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                                         user_prompt=state_prompt_io,
                                                         model=self.backend,
-                                                        temperature=self.temperature,
-                                                        max_tokens=500,
+                                                        temperature=self.temp_expand,
+                                                        max_tokens=self.mt_expand,
                                                         json_format=True,
                                                         llm=self.llm_value
                                                         )

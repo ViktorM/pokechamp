@@ -1064,11 +1064,19 @@ class Pokemon:
         # Get Bayesian predictions
         species_norm = normalize_pokemon_name(self.species)
         try:
-            probabilities = predictor.predict_component_probabilities(
-                species_norm, 
-                teammates=opponent_pokemon,
-                revealed_moves=normalized_moves
-            )
+            # Check if this is Gen1 format (which expects revealed_moves)
+            if battle_format and battle_format == "gen1ou":
+                probabilities = predictor.predict_component_probabilities(
+                    species_norm, 
+                    teammates=opponent_pokemon,
+                    revealed_moves=normalized_moves
+                )
+            else:
+                # Gen9 and other formats don't expect revealed_moves
+                probabilities = predictor.predict_component_probabilities(
+                    species_norm, 
+                    teammates=opponent_pokemon
+                )
         except Exception as e:
             print(f'Bayesian prediction failed for {species_norm}: {e}')
             return None

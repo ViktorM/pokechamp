@@ -59,9 +59,16 @@ parser.add_argument("--team_pool", type=str, default="competitive", choices=["co
 parser.add_argument("--min_elo", type=int, default=None, help="Filter teams by minimum Elo (if available in filenames)")
 parser.add_argument("--max_elo", type=int, default=None, help="Filter teams by maximum Elo (if available in filenames)")
 parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
+parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
+                    help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
 args = parser.parse_args()
     
 async def main():
+    from pokechamp.data_cache import set_elo_tier
+    
+    # Set Elo tier for move sets (use sharper priors for top ladder)
+    set_elo_tier(args.elo_tier)
+    
     player = get_llm_player(args, 
                             args.backend, 
                             args.prompt_algo, 

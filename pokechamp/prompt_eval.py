@@ -23,10 +23,17 @@ system_prompt = (
                 )
 
 
-def eval_action_player(llm: LLMPlayer, gen: int=9, format: str='randombattle'):
+def eval_action_player(llm: LLMPlayer, gen: int=9, format: str='randombattle', 
+                       temp_action=None, mt_action=None):
     '''
     Action Evaluation: Player
+    Forward runtime temp/token settings to eval harness.
     '''
+    # Use player's runtime settings if not explicitly provided
+    if temp_action is None:
+        temp_action = getattr(llm, 'temp_action', 0.0)
+    if mt_action is None:
+        mt_action = getattr(llm, 'mt_action', 16)
     format_str = 'ou'
     if 'randombattle' in format:
         format_str = 'rb'
@@ -61,11 +68,11 @@ def eval_action_player(llm: LLMPlayer, gen: int=9, format: str='randombattle'):
         action_choices = [moves, switches]
 
         # get llm action
-        output = llm.get_LLM_action(system_prompt, prompt, '', temperature=0.7, json_format=True, seed=None, stop=[], max_tokens=20, actions=action_choices)
+        output = llm.get_LLM_action(system_prompt, prompt, '', temperature=temp_action, json_format=True, seed=None, stop=[], max_tokens=mt_action, actions=action_choices)
         try:
             output = orjson.loads(output)
         except:
-            output = llm.get_LLM_action(system_prompt, prompt, '', temperature=0.7, json_format=True, seed=None, stop=[], max_tokens=20, actions=action_choices)
+            output = llm.get_LLM_action(system_prompt, prompt, '', temperature=temp_action, json_format=True, seed=None, stop=[], max_tokens=mt_action, actions=action_choices)
             try:
                 output = orjson.loads(output)
             except:
@@ -353,16 +360,23 @@ async def one_vs_one(args, PNUMBER1, total=1, compare_bots=False):
 def send_to_llm2(llm: LLMPlayer, 
                 system_prompt: str, 
                 prompt: str, 
-                action: str
+                action: str,
+                temp_expand=None,
+                mt_expand=None
                 ) -> int:
+    # Use player's runtime settings if not explicitly provided
+    if temp_expand is None:
+        temp_expand = getattr(llm, 'temp_expand', 0.3)
+    if mt_expand is None:
+        mt_expand = getattr(llm, 'mt_expand', 100)
     # get llm action
     # print(prompt)
-    output = llm.get_LLM_action(system_prompt, prompt, '', temperature=0.3, json_format=True, seed=None, stop=[], max_tokens=100)
+    output = llm.get_LLM_action(system_prompt, prompt, '', temperature=temp_expand, json_format=True, seed=None, stop=[], max_tokens=mt_expand)
     print(output)
     try:
         output = orjson.loads(output)
     except:
-        output = llm.get_LLM_action(system_prompt, prompt, '', temperature=0.3, json_format=True, seed=None, stop=[], max_tokens=100)
+        output = llm.get_LLM_action(system_prompt, prompt, '', temperature=temp_expand, json_format=True, seed=None, stop=[], max_tokens=mt_expand)
         try:
             output = orjson.loads(output)
         except:
@@ -398,8 +412,15 @@ def send_to_llm(llm: LLMPlayer,
                 action_list: list[str],
                 name: str,
                 K: int=5,
+                temp_action=None,
+                mt_action=None
                 ) -> int:
-    outputs = llm.llm.get_LLM_action_topK(system_prompt, prompt, '', actions=action_list, temperature=0.3, json_format=True, seed=None, stop=[], max_tokens=10, top_k=K)
+    # Use player's runtime settings if not explicitly provided
+    if temp_action is None:
+        temp_action = getattr(llm, 'temp_action', 0.0)
+    if mt_action is None:
+        mt_action = getattr(llm, 'mt_action', 10)
+    outputs = llm.llm.get_LLM_action_topK(system_prompt, prompt, '', actions=action_list, temperature=temp_action, json_format=True, seed=None, stop=[], max_tokens=mt_action, top_k=K)
     print(name, 'this is the action', action)
     print(outputs)
     for i, output in enumerate(outputs):
@@ -432,10 +453,17 @@ def send_to_llm_po(llm: LLMPlayer,
                 action_opp_list: list[str],
                 name: str,
                 K: int=5,
+                temp_expand=None,
+                mt_expand=None
                 ) -> int:
+    # Use player's runtime settings if not explicitly provided
+    if temp_expand is None:
+        temp_expand = getattr(llm, 'temp_expand', 0.3)
+    if mt_expand is None:
+        mt_expand = getattr(llm, 'mt_expand', 100)
     opponent_action_text = json.loads(action_opp)['opponent']
     action_opp_list.append(opponent_action_text)
-    outputs, outputs_opp = llm.llm.get_LLM_action_topK(system_prompt, prompt, '', actions=action_list, actions_opp=action_opp_list, temperature=0.3, json_format=True, seed=None, stop=[], max_tokens=100, top_k=K)
+    outputs, outputs_opp = llm.llm.get_LLM_action_topK(system_prompt, prompt, '', actions=action_list, actions_opp=action_opp_list, temperature=temp_expand, json_format=True, seed=None, stop=[], max_tokens=mt_expand, top_k=K)
     print(name, 'this is the action', action, action_opp)
     print(outputs, outputs_opp)
     

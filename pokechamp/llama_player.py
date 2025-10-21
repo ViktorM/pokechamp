@@ -3,7 +3,8 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch.nn.functional as F
-    
+
+
 class LLAMAPlayer():
     def __init__(self, model="meta-llama/Meta-Llama-3.1-8B-Instruct", device=3) -> None:
         model_id = model

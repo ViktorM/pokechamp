@@ -17,6 +17,7 @@ class GameDataCache:
     
     _instance = None
     _data = {}
+    _elo_tier = 1825  # Default to highest Elo tier for sharper priors
     
     def __new__(cls):
         if cls._instance is None:
@@ -27,6 +28,27 @@ class GameDataCache:
         # Initialize data only once
         if not self._data:
             self._load_all_data()
+    
+    @classmethod
+    def set_elo_tier(cls, elo: int):
+        """
+        Set the Elo tier for loading move sets.
+        Available tiers: 0, 1000, 1500, 1825
+        Higher Elo = sharper priors from top ladder play.
+        """
+        available_tiers = [0, 1000, 1500, 1825]
+        if elo not in available_tiers:
+            print(f"⚠️  Invalid Elo tier {elo}. Available: {available_tiers}. Using closest tier.")
+            # Find closest tier
+            elo = min(available_tiers, key=lambda x: abs(x - elo))
+        cls._elo_tier = elo
+        # Clear cached move sets to force reload with new tier
+        instance = cls._instance
+        if instance:
+            keys_to_clear = [k for k in instance._data.keys() if k.startswith('moves_set_')]
+            for key in keys_to_clear:
+                del instance._data[key]
+        print(f"✅ Set Elo tier to {elo} (sharper priors for top ladder)")
     
     def _load_all_data(self):
         """Load all static game data into memory."""
@@ -116,24 +138,41 @@ class GameDataCache:
         return self._data[cache_key]
     
     @lru_cache(maxsize=10)  # Cache up to 10 different formats
-    def get_moves_set(self, format: str) -> Dict[str, Any]:
-        """Get cached moves set data for a specific format."""
-        cache_key = f'moves_set_{format}'
+    def get_moves_set(self, format: str, elo_tier: int = None) -> Dict[str, Any]:
+        """
+        Get cached moves set data for a specific format and Elo tier.
+        
+        Args:
+            format: Battle format (e.g., 'gen9ou')
+            elo_tier: Optional Elo tier override. If None, uses class default.
+        
+        Returns:
+            Dict containing move sets for the format.
+        """
+        if elo_tier is None:
+            elo_tier = self._elo_tier
+        
+        cache_key = f'moves_set_{format}_elo{elo_tier}'
         
         if cache_key not in self._data:
             try:
                 if format == 'gen9ou':
-                    file_path = 'poke_env/data/static/gen9/ou/sets_1000.json'
+                    file_path = f'poke_env/data/static/gen9/ou/sets_{elo_tier}.json'
                 else:
                     # Add more formats as needed
-                    file_path = f'poke_env/data/static/{format}/sets_1000.json'
+                    file_path = f'poke_env/data/static/{format}/sets_{elo_tier}.json'
                 
                 with open(file_path, 'r') as f:
                     self._data[cache_key] = orjson.loads(f.read())
-                print(f"✅ Loaded {format} moves set data")
+                print(f"✅ Loaded {format} moves set data (Elo {elo_tier})")
             except FileNotFoundError:
-                print(f"⚠️  {format} moves set not found, using empty dict")
-                self._data[cache_key] = {}
+                print(f"⚠️  {format} sets_{elo_tier}.json not found, trying fallback...")
+                # Try fallback to 1000 tier
+                if elo_tier != 1000:
+                    return self.get_moves_set(format, elo_tier=1000)
+                else:
+                    print(f"⚠️  No sets found for {format}, using empty dict")
+                    self._data[cache_key] = {}
         
         return self._data[cache_key]
     
@@ -182,9 +221,37 @@ def get_cached_pokedex(gen: int) -> Dict[str, Any]:
     return _cache.get_pokedex(gen)
 
 
-def get_cached_moves_set(format: str) -> Dict[str, Any]:
-    """Get cached moves set data for a specific format."""
-    return _cache.get_moves_set(format)
+def get_cached_moves_set(format: str, elo_tier: int = None) -> Dict[str, Any]:
+    """
+    Get cached moves set data for a specific format.
+    
+    Args:
+        format: Battle format (e.g., 'gen9ou')
+        elo_tier: Optional Elo tier (0, 1000, 1500, 1825). 
+                  If None, uses default (1825).
+    
+    Returns:
+        Dict containing move sets for the format at the specified Elo tier.
+    """
+    return _cache.get_moves_set(format, elo_tier)
+
+
+def set_elo_tier(elo: int):
+    """
+    Set the default Elo tier for move set loading.
+    
+    Args:
+        elo: Elo tier (0, 1000, 1500, 1825)
+             Higher = sharper priors from top ladder play
+    
+    Example:
+        # Use 1825 Elo sets for top ladder
+        set_elo_tier(1825)
+        
+        # Use 1500 Elo sets for mid ladder
+        set_elo_tier(1500)
+    """
+    GameDataCache.set_elo_tier(elo)
 
 
 def clear_data_cache():

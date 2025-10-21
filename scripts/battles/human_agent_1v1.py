@@ -37,9 +37,15 @@ parser.add_argument("--backend", type=str, default="openai/gpt-4o", choices=[
 parser.add_argument("--log_dir", type=str, default="./battle_log/ladder")
 parser.add_argument("--device", type=int, default=0)
 parser.add_argument("--name", type=str, default='pokechamp', choices=['pokechamp', 'pokellmon', 'one_step', 'abyssal', 'max_power', 'random'])
+parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
+                    help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
 args = parser.parse_args()
 
 async def main():
+    from pokechamp.data_cache import set_elo_tier
+    
+    # Set Elo tier for move sets
+    set_elo_tier(args.elo_tier)
 
     opponent = get_llm_player(args, 
                             args.backend, 

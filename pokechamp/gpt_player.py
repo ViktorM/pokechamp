@@ -5,15 +5,16 @@ import os
 
 
 class GPTPlayer():
-    def __init__(self, api_key=""):
+    def __init__(self, api_key="", service_tier: str='priority'):
         if api_key == "":
             self.api_key = os.getenv('OPENAI_API_KEY')
         else:
             self.api_key = api_key
         self.completion_tokens = 0
         self.prompt_tokens = 0
+        self.service_tier = service_tier
 
-    def get_LLM_action(self, system_prompt, user_prompt, model='gpt-4o', temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, reasoning_effort="medium") -> str:
+    def get_LLM_action(self, system_prompt, user_prompt, model='gpt-4o', temperature=0.3, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, reasoning_effort="low") -> str:
         client = OpenAI(api_key=self.api_key)
 
         # Determine if model supports reasoning_effort (o3-mini, o4-mini, o3, gpt-5 series)
@@ -41,12 +42,15 @@ class GPTPlayer():
             if json_format:
                 request_params["response_format"] = {"type": "json_object"}
  
+            # OpenAI supports service_tier for priority latency on eligible models
+            if self.service_tier:
+                request_params["service_tier"] = self.service_tier  # e.g., "priority"
             response = client.chat.completions.create(**request_params)
         except RateLimitError:
             # sleep 5 seconds and try again
             sleep(5)  
             print('rate limit error')
-            return self.get_LLM_action(system_prompt, user_prompt, model, temperature, json_format, seed, stop, max_tokens, actions)
+            return self.get_LLM_action(system_prompt, user_prompt, model, temperature, json_format, seed, stop, max_tokens, actions, reasoning_effort)
         outputs = response.choices[0].message.content
         # log completion tokens
         self.completion_tokens += response.usage.completion_tokens
@@ -55,7 +59,7 @@ class GPTPlayer():
             return outputs, True
         return outputs, False
 
-    def get_LLM_query(self, system_prompt, user_prompt, temperature=0.7, model='gpt-4o', json_format=False, seed=None, stop=[], max_tokens=200):
+    def get_LLM_query(self, system_prompt, user_prompt, temperature=0.3, model='gpt-4o', json_format=False, seed=None, stop=[], max_tokens=200):
         client = OpenAI(api_key=self.api_key)
         # client = AzureOpenAI()
         try:
@@ -63,18 +67,22 @@ class GPTPlayer():
             if json_format:
                 output_padding  = '\n{"'
 
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
+            params = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt+output_padding}
                 ],
-                temperature=temperature,
-                stream=False,
-                stop=stop,
-                max_tokens=max_tokens
-            )
+                "temperature": temperature,
+                "stream": False,
+                "stop": stop,
+                "max_tokens": max_tokens,
+            }
+            if self.service_tier:
+                params["service_tier"] = self.service_tier
+            response = client.chat.completions.create(**params)
             message = response.choices[0].message.content
+
         except RateLimitError:
             # sleep 5 seconds and try again
             sleep(5)  
@@ -87,4 +95,5 @@ class GPTPlayer():
             message_json = '{"' + message[json_start:json_end]
             if len(message_json) > 0:
                 return message_json, True
+
         return message, False

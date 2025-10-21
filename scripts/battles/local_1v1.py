@@ -76,11 +76,17 @@ parser.add_argument("--max_tokens", type=int, default=300, help="Max tokens for 
 parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
 parser.add_argument("--player_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (player)")
 parser.add_argument("--opponent_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (opponent)")
+parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
+                    help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
 
 args = parser.parse_args()
 
 async def main():
     import logging
+    from pokechamp.data_cache import set_elo_tier
+    
+    # Set Elo tier for move sets
+    set_elo_tier(args.elo_tier)
     
     # Set logging level based on verbose flag
     log_level = logging.DEBUG if args.verbose else logging.WARNING
