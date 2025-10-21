@@ -74,6 +74,7 @@ class LocalSimPool:
         self._in_use_sims: List[LocalSim] = []
         self._initial_size = initial_size
         self._creation_template: Optional[Dict[str, Any]] = None
+        self._reuse_count = 0  # Track how many times we reused a sim from pool
         
     def initialize_pool(self, template_battle: Battle, **localsim_kwargs):
         """Initialize the pool with template LocalSim instances."""
@@ -92,6 +93,7 @@ class LocalSimPool:
         """Get a LocalSim from the pool, creating new one if needed."""
         if self._available_sims:
             sim = self._available_sims.pop()
+            self._reuse_count += 1  # Increment reuse counter
             # Reset the simulation with new battle state
             sim.battle = deepcopy(battle)
             self._in_use_sims.append(sim)
@@ -124,6 +126,14 @@ class LocalSimPool:
     def get_stats(self) -> Tuple[int, int, int]:
         """Get pool statistics: (available, in_use, total)."""
         return len(self._available_sims), len(self._in_use_sims), len(self._available_sims) + len(self._in_use_sims)
+    
+    def get_reuse_count(self) -> int:
+        """Get the number of times a sim was reused from the pool."""
+        return self._reuse_count
+    
+    def reset_metrics(self):
+        """Reset reuse counter for new search."""
+        self._reuse_count = 0
 
 
 class MinimaxCache:
@@ -263,6 +273,7 @@ class MinimaxOptimizer:
     def get_performance_stats(self) -> Dict[str, Any]:
         """Get performance statistics."""
         pool_available, pool_in_use, pool_total = self.sim_pool.get_stats()
+        reuse = self.sim_pool.get_reuse_count()
         cache_hits, cache_misses, cache_hit_rate = self.cache.get_stats()
         
         return {
@@ -271,7 +282,8 @@ class MinimaxOptimizer:
                 'available': pool_available,
                 'in_use': pool_in_use,
                 'total': pool_total,
-                'reuse_rate': self.stats['pool_reuses'] / max(1, self.stats['nodes_created'])
+                'reuse': reuse,
+                'reuse_rate': reuse / max(1, self.stats['nodes_created'])
             },
             'cache_stats': {
                 'hits': cache_hits,
@@ -290,6 +302,7 @@ class MinimaxOptimizer:
             'total_time': 0.0
         }
         self.cache.clear()
+        self.sim_pool.reset_metrics()  # Reset pool reuse counter
 
 
 # Global optimizer instance

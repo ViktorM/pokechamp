@@ -199,6 +199,57 @@ class LLMPlayer(Player):
         except Exception:
             pass
         return None
+    
+    def _safe_default(self, battle: Battle) -> BattleOrder:
+        """
+        Robust fallback when no action can be determined.
+        
+        Priority:
+        1. Max-damage legal move
+        2. First legal move
+        3. First legal switch
+        4. Random move (last resort)
+        """
+        # Try max damage move first
+        md = self.choose_max_damage_move(battle)
+        if md is not None:
+            return md
+        
+        # Try any legal move
+        if battle.available_moves:
+            return self.create_order(battle.available_moves[0])
+        
+        # Try any legal switch
+        if battle.available_switches:
+            return self.create_order(battle.available_switches[0])
+        
+        # If server sent wait-state, higher layer should have early-returned;
+        # otherwise do nothing (Showdown will ignore or we pick random)
+        return self.choose_random_move(battle)
+    
+    def _finalize_action(self, selected: Optional[BattleOrder], raw_text: str, battle: Battle) -> BattleOrder:
+        """
+        Finalize action selection with robust fallbacks.
+        
+        Args:
+            selected: The action selected by LLM/minimax (may be None)
+            raw_text: Raw LLM output for text recovery
+            battle: Current battle state
+        
+        Returns:
+            A valid BattleOrder (guaranteed non-None)
+        """
+        # If we have a valid action, use it
+        if selected is not None:
+            return selected
+        
+        # Try to recover from raw text
+        recovered = self._recover_action_from_text(raw_text, battle)
+        if recovered is not None:
+            return recovered
+        
+        # Use safe default as last resort
+        return self._safe_default(battle)
 
     def get_LLM_action(self, system_prompt, user_prompt, model, temperature=None, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None, reasoning_effort=None) -> str:
         if reasoning_effort is None:
@@ -809,20 +860,36 @@ class LLMPlayer(Player):
                                     tokens_prompt=0, tokens_completion=0, near_timeout=False, progress_score=progress_score)
                 return self.choose_default_move()
             
-            print('No action found. Choosing max damage move')
+            print('No action found. Using robust fallback chain')
             try:
-                print('No action found', llm_action_json, actions, dont_verify)
+                print('No action found debug:', llm_action_json if 'llm_action_json' in locals() else 'no json', 
+                      actions if 'actions' in locals() else 'no actions', dont_verify)
             except:
                 pass
-            print()
-            # raise ValueError('No valid move', battle.active_pokemon.fainted, len(battle.available_switches))
+            
+            # Use robust finalization with text recovery and safe default
+            raw_text = llm_output if 'llm_output' in locals() else ''
+            next_action = self._finalize_action(None, raw_text, battle)
+            
             progress_score = self._record_progress(battle)
             near_timeout = (time.time() - start_time) > near_timeout_threshold
             if near_timeout:
                 self._record_timeout(battle, avoided=True)
-            self._record_metric(battle, start_time, json_ok=False, fallback_reason='no_valid_action', action_kind='max_damage', action_label='', max_tokens=self.max_tokens,
-                                tokens_prompt=0, tokens_completion=0, near_timeout=near_timeout, progress_score=progress_score)
-            next_action = self.choose_max_damage_move(battle)
+            
+            # Determine action label for metrics
+            action_label = ''
+            action_kind = 'safe_default'
+            if next_action and hasattr(next_action, 'move'):
+                action_label = next_action.move.id if next_action.move else ''
+                action_kind = 'move'
+            elif next_action and hasattr(next_action, 'pokemon'):
+                action_label = next_action.pokemon.species if next_action.pokemon else ''
+                action_kind = 'switch'
+            
+            self._record_metric(battle, start_time, json_ok=False, fallback_reason='no_valid_action', 
+                              action_kind=action_kind, action_label=action_label, max_tokens=self.max_tokens,
+                              tokens_prompt=0, tokens_completion=0, near_timeout=near_timeout, progress_score=progress_score)
+        
         return next_action
 
     def _extract_json_obj(self, s: str) -> Optional[Dict[str, Any]]:
@@ -1498,24 +1565,43 @@ class LLMPlayer(Player):
                 print("Using pre-scores argmax fallback")
                 return pruned_map[best_id]
         
-        # Final fallback to damage calculator
-        print("Rank algorithm failed after all retries, using damage calculator fallback")
-        move, _ = self.dmg_calc_move(battle)
-        if move is not None:
-            progress_score = self._record_progress(battle)
-            self._record_metric(battle, start_time, json_ok=False, fallback_reason='rank_failed_dmgcalc',
-                              action_kind='move', action_label=str(getattr(move, 'order', '')),
-                              max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0,
-                              near_timeout=False, progress_score=progress_score)
-            return move
+        # Final fallback chain with robust finalization
+        print("Rank algorithm failed after all retries, using robust fallback chain")
         
-        # Last resort
+        # Try damage calculator first
+        move, _ = self.dmg_calc_move(battle)
+        
+        # Finalize with text recovery and safe default
+        raw_text = llm_output if 'llm_output' in locals() else ''
+        final_action = self._finalize_action(move, raw_text, battle)
+        
+        # Determine action label for metrics
+        action_label = ''
+        action_kind = 'safe_default'
+        fallback_reason = 'rank_failed_safe_default'
+        
+        if move is not None:
+            # Damage calc worked
+            action_kind = 'dmg_calc'
+            fallback_reason = 'rank_failed_dmgcalc'
+            if hasattr(move, 'move') and move.move:
+                action_label = move.move.id
+        elif final_action:
+            # Finalization produced something
+            if hasattr(final_action, 'move') and final_action.move:
+                action_label = final_action.move.id
+                action_kind = 'move'
+            elif hasattr(final_action, 'pokemon') and final_action.pokemon:
+                action_label = final_action.pokemon.species
+                action_kind = 'switch'
+        
         progress_score = self._record_progress(battle)
-        self._record_metric(battle, start_time, json_ok=False, fallback_reason='rank_failed_maxdmg',
-                          action_kind='max_damage', action_label='', max_tokens=self.max_tokens,
+        self._record_metric(battle, start_time, json_ok=False, fallback_reason=fallback_reason,
+                          action_kind=action_kind, action_label=action_label, max_tokens=self.max_tokens,
                           tokens_prompt=0, tokens_completion=0, near_timeout=False,
                           progress_score=progress_score)
-        return self.choose_max_damage_move(battle)
+        
+        return final_action
 
     def sc(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim):
         # Track timeout for SC algorithm
@@ -1756,39 +1842,53 @@ class LLMPlayer(Player):
         return self.use_optimized_minimax
 
     def _minimax_fallback(self, battle, start_time, reason: str):
+        """
+        Minimax fallback with robust finalization.
+        
+        Uses damage calculator, then safe default chain if needed.
+        """
+        # Try damage calculator
         move, _ = self.dmg_calc_move(battle)
-        progress_score = self._record_progress(battle)
+        
+        # Use robust finalization to ensure we always return a valid action
+        final_action = self._finalize_action(move, '', battle)
+        
+        # Determine action label for metrics
+        action_label = ''
+        action_kind = 'safe_default'
+        fallback_reason = f'{reason}_safe_default'
+        
         if move is not None:
-            self._record_metric(
-                battle,
-                start_time,
-                json_ok=False,
-                fallback_reason=reason,
-                action_kind='move',
-                action_label=str(getattr(move, 'order', '')),
-                max_tokens=self.max_tokens,
-                tokens_prompt=0,
-                tokens_completion=0,
-                near_timeout=False,
-                progress_score=progress_score,
-            )
-            return move
-
-        max_damage_action = self.choose_max_damage_move(battle)
+            # Damage calc worked
+            action_kind = 'dmg_calc'
+            fallback_reason = reason
+            if hasattr(move, 'move') and move.move:
+                action_label = move.move.id
+        elif final_action:
+            # Finalization produced something
+            if hasattr(final_action, 'move') and final_action.move:
+                action_label = final_action.move.id
+                action_kind = 'move'
+            elif hasattr(final_action, 'pokemon') and final_action.pokemon:
+                action_label = final_action.pokemon.species
+                action_kind = 'switch'
+        
+        progress_score = self._record_progress(battle)
         self._record_metric(
             battle,
             start_time,
             json_ok=False,
-            fallback_reason=f'{reason}_maxdmg',
-            action_kind='max_damage',
-            action_label=str(getattr(max_damage_action, 'order', '')),
+            fallback_reason=fallback_reason,
+            action_kind=action_kind,
+            action_label=action_label,
             max_tokens=self.max_tokens,
             tokens_prompt=0,
             tokens_completion=0,
             near_timeout=False,
             progress_score=progress_score,
         )
-        return max_damage_action
+        
+        return final_action
 
     def check_timeout(self, start_time, battle):
         if time.time() - start_time > 30:
@@ -2274,6 +2374,15 @@ class LLMPlayer(Player):
                             node.hp_diff = node.simulation.get_hp_diff()
                         print(f"LLM value function failed, using damage calculator fallback: {e}")
                     
+                    # Cache the evaluation result to avoid re-computing
+                    # Key: (parent_state, player_action, opp_action) → hp_diff
+                    try:
+                        if node.parent_node and node.parent_node.simulation:
+                            parent_state_hash = create_battle_state_hash(node.parent_node.simulation.battle)
+                            optimizer.cache_evaluation(parent_state_hash, str(node.action), str(node.action_opp), node.hp_diff)
+                    except Exception:
+                        pass  # Cache failure shouldn't break search
+                    
                     leaf_nodes.append(node)
                     continue
                 
@@ -2334,8 +2443,35 @@ class LLMPlayer(Player):
                     for action_p in player_actions[:player_limit]:
                         for action_o in opponent_actions[:opponent_limit]:
                             try:
-                                child_node = node.create_child_node(action_p, action_o)
-                                q.append(child_node)
+                                # Check cache BEFORE stepping to avoid expensive simulation
+                                parent_state_hash = create_battle_state_hash(node.simulation.battle)
+                                cached_value = optimizer.get_cached_evaluation(parent_state_hash, str(action_p), str(action_o))
+                                
+                                if cached_value is not None:
+                                    # Cache hit! Skip simulation entirely and use cached value
+                                    # Create a minimal child node without acquiring sim (no stepping needed)
+                                    class CachedChildNode:
+                                        """Lightweight node for cached evaluations (no sim needed)."""
+                                        def __init__(self, action, action_opp, hp_diff, parent):
+                                            self.action = action
+                                            self.action_opp = action_opp
+                                            self.hp_diff = hp_diff
+                                            self.parent_node = parent
+                                            self.parent_action = parent.action
+                                            self.children = []
+                                            self.depth = parent.depth + 1
+                                            self.simulation = None  # No sim needed for cached nodes
+                                    
+                                    child_node = CachedChildNode(action_p, action_o, cached_value, node)
+                                    node.children.append(child_node)
+                                    # Don't increment nodes_created or add to queue - this is a cache hit
+                                else:
+                                    # Cache miss - need to simulate and evaluate
+                                    child_node = node.create_child_node(action_p, action_o)
+                                    optimizer.stats['nodes_created'] += 1
+                                    q.append(child_node)
+                                    # Will be evaluated and cached later
+                                    
                             except Exception as e:
                                 print(f"Failed to create child node: {e}")
                                 continue
