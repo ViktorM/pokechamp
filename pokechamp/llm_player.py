@@ -2395,320 +2395,6 @@ Score each action and return the complete ranking array."""
             # Fallback: return empty list (caller should handle)
             return []
 
-    def tree_search(self, retries, battle, sim=None, return_opp=False, start_time=None) -> BattleOrder:
-        # generate local simulation
-        root = SimNode(battle, 
-                        self.move_effect,
-                        self.pokemon_move_dict,
-                        self.ability_effect,
-                        self.pokemon_ability_dict,
-                        self.item_effect,
-                        self.pokemon_item_dict,
-                        self.gen,
-                        self._dynamax_disable,
-                        depth=1,
-                        format=self.format,
-                        prompt_translate=self.prompt_translate,
-                        sim=sim
-                        ) 
-        q = [
-                root
-            ]
-        leaf_nodes = []
-        # create node and add to q B times
-        if start_time is None:
-            start_time = time.time()
-        internal_start = time.time()
-
-        # Set a hard deadline for minimax - leave 1s for final processing
-        minimax_deadline = start_time + self.move_time_limit_s - 1.0
-
-        while len(q) != 0:
-            # Check timeout before processing next node
-            if time.time() > minimax_deadline:
-                print(f'Minimax timeout: explored {len(leaf_nodes)} leaf nodes, returning best so far')
-                # If we have at least explored some nodes, use them
-                if leaf_nodes:
-                    # Use whatever we have explored so far
-                    break
-
-                # Otherwise, fall back to damage calculator
-                dmg_calc_out, _ = self.dmg_calc_move(battle)
-                if dmg_calc_out is not None:
-                    progress_score = self._record_progress(battle)
-                    self._record_timeout(battle, avoided=False)
-                    self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_timeout_dmgcalc', 
-                                        action_kind='move', action_label=str(getattr(dmg_calc_out, 'order', '')), 
-                                        max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
-                                        near_timeout=True, progress_score=progress_score)
-                    if return_opp:
-                        try:
-                            action_opp, _ = self.estimate_matchup(root.simulation, battle, 
-                                                               battle.opponent_active_pokemon, 
-                                                               battle.active_pokemon, is_opp=True)
-                            return dmg_calc_out, self.create_order(action_opp) if action_opp else None
-                        except:
-                            return dmg_calc_out, None
-                    return dmg_calc_out
-
-                # Last resort: max damage move
-                progress_score = self._record_progress(battle)
-                self._record_timeout(battle, avoided=False)
-                self._record_metric(battle, start_time, json_ok=False, fallback_reason='minimax_timeout_maxdmg', 
-                                    action_kind='max_damage', action_label='', max_tokens=self.max_tokens, 
-                                    tokens_prompt=0, tokens_completion=0, near_timeout=True, 
-                                    progress_score=progress_score)
-                return self.choose_max_damage_move(battle)
-
-            node = q.pop(0)
-            # choose node for expansion
-            # generate B actions
-            player_actions = []
-            system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, action_prompt_switch, action_prompt_move = node.simulation.get_player_prompt(return_actions=True)
-            # panic_move = self.check_timeout(start_time, battle)
-            # if panic_move is not None:
-            #     return panic_move
-            # end if terminal
-            if node.simulation.is_terminal() or node.depth == self.K:
-                try:
-                    # value estimation for leaf nodes
-                    value_prompt = 'Evaluate the score from 1-100 based on how likely the player is to win. Higher is better. Start at 50 points.' +\
-                                    'Add points based on the effectiveness of current available moves.' +\
-                                    'Award points for each pokemon remaining on the player\'s team, weighted by their strength' +\
-                                    'Add points for boosted status and opponent entry hazards and subtract points for status effects and player entry hazards. ' +\
-                                    'Subtract points for excessive switching.' +\
-                                    'Subtract points based on the effectiveness of the opponent\'s current moves, especially if they have a faster speed.' +\
-                                    'Remove points for each pokemon remaining on the opponent\'s team, weighted by their strength.\n'
-                    cot_prompt = 'Briefly justify your total score, up to 100 words. Then, conclude with the score in the JSON format: {"score": <total_points>}. '
-                    state_prompt_io = state_prompt + value_prompt + cot_prompt
-                    llm_output = self.get_LLM_action(system_prompt=system_prompt,
-                                                    user_prompt=state_prompt_io,
-                                                    model=self.backend,
-                                                    temperature=self.temp_expand,
-                                                    max_tokens=self.mt_expand,
-                                                    json_format=True,
-                                                    llm=self.llm_value
-                                                    )
-                    # load when llm does heavylifting for parsing
-                    llm_action_json = json.loads(llm_output)
-                    node.hp_diff = float(llm_action_json['score'])
-                except Exception as e:
-                    node.hp_diff = node.simulation.get_hp_diff()                    
-                    print(e)
-                
-                # Cache the child state value (CRITICAL for TT hits!)
-                # Note: This is in old tree_search (dead code), but kept for reference
-                child_tt_key = mk_ttkey(node.simulation.battle)
-                depth_remaining = max(0, self.K - node.depth)
-                optimizer.cache_state_value(child_tt_key, node.hp_diff, depth_remaining)
-
-                leaf_nodes.append(node)
-                continue
-
-            # panic_move = self.check_timeout(start_time, battle)
-            # if panic_move is not None:
-            #     return panic_move
-            # estimate opp
-            try:
-                action_opp, opp_turns = self.estimate_matchup(node.simulation, node.simulation.battle, node.simulation.battle.opponent_active_pokemon, node.simulation.battle.active_pokemon, is_opp=True)
-            except:
-                action_opp = None
-                opp_turns = np.inf
-
-            ##############################
-            # generate players's action  #
-            ##############################
-            if not node.simulation.battle.active_pokemon.fainted and len(battle.available_moves) > 0:
-                # get dmg calc move
-                dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(node.simulation.battle)
-                if dmg_calc_out is not None:
-                    if dmg_calc_turns <= opp_turns:
-                        try:
-                            # ask LLM to use heuristic tool or minimax search
-                            tool_prompt = '''Based on the current battle state, evaluate whether to use the damage calculator tool or the minimax tree search method. Consider the following factors:
-
-                                1. Damage calculator advantages:
-                                - Quick and efficient for finding optimal damaging moves
-                                - Useful when a clear type advantage or high-power move is available
-                                - Effective when the opponent's is not switching and current pokemon is likely to KO opponent
-
-                                2. Minimax tree search advantages:
-                                - Can model opponent behavior and predict future moves
-                                - Useful in complex situations with multiple viable options
-                                - Effective when long-term strategy is crucial
-
-                                3. Current battle state:
-                                - Remaining Pokémon on each side
-                                - Health of active Pokémon
-                                - Type matchups
-                                - Available moves and their effects
-                                - Presence of status conditions or field effects
-
-                                4. Uncertainty level:
-                                - How predictable is the opponent's next move?
-                                - Are there multiple equally viable options for your next move?
-
-                                Evaluate these factors and decide which method would be more beneficial in the current situation. Output your choice in the following JSON format:
-
-                                {"choice":"damage calculator"} or {"choice":"minimax"}'''
-
-                            state_prompt_io = state_prompt + tool_prompt
-                            # Use action-tier settings for structured JSON selection
-                            llm_output = self.get_LLM_action(system_prompt=system_prompt,
-                                                            user_prompt=state_prompt_io,
-                                                            model=self.backend,
-                                                            temperature=self.temp_action,
-                                                            max_tokens=self.mt_action,
-                                                            json_format=True,
-                                                            )
-                            # load when llm does heavylifting for parsing
-                            llm_action_json = json.loads(llm_output)
-                            if 'choice' in llm_action_json.keys():
-                                if llm_action_json['choice']  != 'minimax':
-                                    if return_opp:
-                                        # use tool to save time and llm when move makes bigger difference
-                                        return dmg_calc_out, action_opp
-                                    return dmg_calc_out
-                        except:
-                            print('defaulting to minimax')
-                    player_actions.append(dmg_calc_out)
-
-            # panic_move = self.check_timeout(start_time, battle)
-            # if panic_move is not None:
-            #     return panic_move
-            # get llm switch
-            if len(node.simulation.battle.available_switches) != 0:# or opp_turns < dmg_calc_turns):
-                state_action_prompt_switch = state_action_prompt + action_prompt_switch + '\nYou can only choose to switch this turn.\n'
-                constraint_prompt_io = 'Choose the best action and your output MUST be a JSON like: {"switch":"<switch_pokemon_name>"}.\n'
-                for i in range(2):
-                    action_llm_switch = self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt_switch, node.simulation.battle, node.simulation)
-                    if len(player_actions) == 0:
-                        player_actions.append(action_llm_switch)
-                    elif action_llm_switch.message != player_actions[-1].message:
-                        player_actions.append(action_llm_switch)
-
-            if not node.simulation.battle.active_pokemon.fainted and len(battle.available_moves) > 0:# and not opp_turns < dmg_calc_turns:
-                # get llm move
-                state_action_prompt_move = state_action_prompt + action_prompt_move + '\nYou can only choose to move this turn.\n'
-                constraint_prompt_io = 'Choose the best action and your output MUST be a JSON like: {"move":"<move_name>"}.\n'
-                action_llm_move = self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt_move, node.simulation.battle, node.simulation)
-                if len(player_actions) == 0:
-                    player_actions.append(action_llm_move)
-                elif action_llm_move.message != player_actions[0].message:
-                    player_actions.append(action_llm_move)
-            # panic_move = self.check_timeout(start_time, battle)
-            # if panic_move is not None:
-            #     return panic_move
-            ##############################
-            # generate opponent's action #
-            ##############################
-            opponent_actions = []
-            tool_is_optimal = False
-            # dmg calc suggestion
-            # action_opp, opp_turns = self.estimate_matchup(node.simulation, node.simulation.battle, node.simulation.battle.opponent_active_pokemon, node.simulation.battle.active_pokemon, is_opp=True)
-            if action_opp is not None:
-                tool_is_optimal = True
-                opponent_actions.append(self.create_order(action_opp))
-            # heuristic matchup switch action
-            best_score = np.inf
-            best_action = None
-            for mon in node.simulation.battle.opponent_team.values():
-                if mon.species == node.simulation.battle.opponent_active_pokemon.species:
-                    continue
-                score = self._estimate_matchup(mon, node.simulation.battle.active_pokemon)
-                if score < best_score:
-                    best_score = score
-                    best_action = mon
-            if best_action is not None:
-                opponent_actions.append(self.create_order(best_action))
-            # panic_move = self.check_timeout(start_time, battle)
-            # if panic_move is not None:
-            #     return panic_move
-            # create opponent prompt from battle sim
-            system_prompt_o, state_prompt_o, constraint_prompt_cot_o, constraint_prompt_io_o, state_action_prompt_o = node.simulation.get_opponent_prompt(system_prompt)
-            action_o = self.io(2, system_prompt_o, state_prompt_o, constraint_prompt_cot_o, constraint_prompt_io_o, state_action_prompt_o, node.simulation.battle, node.simulation, dont_verify=True)
-            is_repeat_action_o = np.array([action_o.message == opponent_action.message for opponent_action in opponent_actions]).any()
-            if not is_repeat_action_o:
-                opponent_actions.append(action_o)
-            # panic_move = self.check_timeout(start_time, battle)
-            # if panic_move is not None:
-            #     return panic_move
-            # simulate outcome
-            if node.depth < self.K:
-                # Further limit branching if we're running low on time
-                time_remaining = minimax_deadline - time.time()
-                if time_remaining < 2.0:  # Less than 2 seconds left
-                    # Only explore 1 action each when low on time
-                    player_actions = player_actions[:1]
-                    opponent_actions = opponent_actions[:1]
-                else:
-                    # Normal limits - already limited to 2 each in the generation code above
-                    player_actions = player_actions[:2]
-                    opponent_actions = opponent_actions[:2]
-                
-                for action_p in player_actions:
-                    for action_o in opponent_actions:
-                        node_new = copy(node)
-                        node_new.simulation.battle = copy(node.simulation.battle)
-                        # if not tool_is_optimal:
-                        node_new.children = []
-                        node_new.depth = node.depth + 1
-                        node_new.action = action_p
-                        node_new.action_opp = action_o
-                        node_new.parent_node = node
-                        node_new.parent_action = node.action
-                        node.children.append(node_new)
-                        node_new.simulation.step(action_p, action_o)
-                        q.append(node_new)
-
-        # choose best action according to max or min rule
-        def get_tree_action(root: SimNode):
-            if len(root.children) == 0:
-                # This shouldn't happen for root node
-                if root.action is None:
-                    raise RuntimeError("Minimax search produced no valid actions")
-                return root.action, root.hp_diff, root.action_opp
-
-            score_dict = {}
-            action_dict = {}
-            opp_dict = {}
-            for child in root.children:
-                if child.action is None:
-                    if self.logger.level <= logging.DEBUG:
-                        print(f"DEBUG: Found None action in child node at depth {child.depth} (old minimax)")
-                    continue
-                action = str(child.action.order)
-                _, score, _ = get_tree_action(child)
-                if action in score_dict.keys():
-                    # imitation
-                    # score_dict[action] = score + score_dict[action]
-                    # minimax
-                    score_dict[action] = min(score, score_dict[action])
-                else:
-                    score_dict[action] = score
-                    action_dict[action] = child.action
-                    opp_dict[action] = child.action_opp
-            scores = list(score_dict.values())
-            best_action_str = list(action_dict.keys())[np.argmax(scores)]
-            return action_dict[best_action_str], score_dict[best_action_str], opp_dict[best_action_str]
-
-        action, _, action_opp = get_tree_action(root)
-        end_time = time.time()
-
-        # Record successful minimax completion
-        progress_score = self._record_progress(battle)
-        near_timeout = (end_time - start_time) > max(0.0, self.move_time_limit_s - 2.0)
-        if near_timeout:
-            self._record_timeout(battle, avoided=True)
-        self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
-                            action_kind='minimax', action_label=str(action.message if hasattr(action, 'message') else action.order), 
-                            max_tokens=self.max_tokens, tokens_prompt=0, tokens_completion=0, 
-                            near_timeout=near_timeout, progress_score=progress_score)
-
-        if return_opp:
-            return action, action_opp
-        return action
-
     def tree_search_optimized(self, retries, battle, sim=None, return_opp=False, start_time=None) -> BattleOrder:
         """
         Optimized version of tree_search using object pooling and caching.
@@ -2773,8 +2459,8 @@ Score each action and return the complete ranking array."""
                 # Check timeout before processing next node
                 if time.time() > minimax_deadline:
                     print(f'Minimax timeout: explored {len(leaf_nodes)} leaf nodes, returning best so far')
-                    # If we have at least explored some nodes, use them
-                    if leaf_nodes:
+                    # If we have evaluated nodes (leaves or cached children), use them
+                    if leaf_nodes or (root.children and any(getattr(c, "hp_diff", None) is not None for c in root.children)):
                         # Use whatever we have explored so far
                         break
                     # Otherwise, fall back to damage calculator
@@ -2976,6 +2662,8 @@ Score each action and return the complete ranking array."""
                 # Use batched proposal for root node, fallback to old method for deeper nodes
                 if node.depth == 0:
                     # Batched proposal at root (ONE call for both player and opponent)
+                    if self.logger.level <= logging.DEBUG:
+                        print("ROOT PROPOSAL ACTIVE")
                     try:
                         timer.push('llm_calls')
                         seed = self.propose_actions_topk(node.simulation.battle, node.simulation, 
@@ -3031,13 +2719,13 @@ Score each action and return the complete ranking array."""
                             if action_opp:
                                 opponent_actions.append(self.create_order(action_opp))
 
-                            # Best switch (heuristic)
-                            best_score = np.inf
+                            # Best switch (heuristic) - higher score = better for opponent
+                            best_score = -np.inf
                             best_switch = None
                             for mon in b.opponent_team.values():
                                 if mon.species != b.opponent_active_pokemon.species and not mon.fainted:
                                     score = self._estimate_matchup(mon, b.active_pokemon)
-                                    if score < best_score:
+                                    if score > best_score:
                                         best_score = score
                                         best_switch = mon
                             if best_switch and len(opponent_actions) < 2:
@@ -3069,8 +2757,8 @@ Score each action and return the complete ranking array."""
                         best_switch_score = -np.inf
                         best_switch = None
                         for switch_mon in b.available_switches:
-                            # Estimate matchup score
-                            score = -self._estimate_matchup(switch_mon, b.opponent_active_pokemon)
+                            # Estimate matchup score (higher = better for switch_mon)
+                            score = self._estimate_matchup(switch_mon, b.opponent_active_pokemon)
                             if score > best_switch_score:
                                 best_switch_score = score
                                 best_switch = switch_mon
@@ -3086,7 +2774,7 @@ Score each action and return the complete ranking array."""
                     # Safety net 2: If still empty, add 1-2 best switches
                     if not player_actions and b.available_switches:
                         switches = sorted(b.available_switches,
-                                        key=lambda s: -self._estimate_matchup(s, b.opponent_active_pokemon))[:2]
+                                        key=lambda s: self._estimate_matchup(s, b.opponent_active_pokemon), reverse=True)[:2]
                         for sw in switches:
                             player_actions.append(self.create_order(sw))
 
@@ -3101,14 +2789,14 @@ Score each action and return the complete ranking array."""
                     if action_opp is not None:
                         opponent_actions.append(self.create_order(action_opp))
 
-                    # Add best defensive pivot/switch
+                    # Add best defensive pivot/switch - higher score = better for opponent
                     if len(opponent_actions) < 2:
-                        best_score = np.inf
+                        best_score = -np.inf
                         best_switch = None
                         for mon in b.opponent_team.values():
                             if mon != b.opponent_active_pokemon and not mon.fainted:
                                 score = self._estimate_matchup(mon, b.active_pokemon)
-                                if score < best_score:
+                                if score > best_score:
                                     best_score = score
                                     best_switch = mon
                         if best_switch:
@@ -3226,6 +2914,7 @@ Score each action and return the complete ranking array."""
                     for node, score in zip(unevaluated_leaves, scores):
                         if score is not None:
                             node.hp_diff = float(score)
+                            assert 0.0 <= node.hp_diff <= 100.0, f"Invalid score: {node.hp_diff}"
                             # Cache both TT and parent-edge
                             from pokechamp.minimax_optimizer import mk_ttkey, canonical_action
                             depth_remaining = self.K - node.depth
@@ -3248,6 +2937,7 @@ Score each action and return the complete ranking array."""
                             team_o = sum(not p.fainted for p in b.opponent_team.values())
                             v = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)  # 0..100
                             node.hp_diff = float(v) # v in 0...100
+                            assert 0.0 <= node.hp_diff <= 100.0, f"Invalid heuristic: {node.hp_diff}"
 
                             # Cache the fallback evaluation
                             depth_remaining = self.K - node.depth
@@ -3274,6 +2964,7 @@ Score each action and return the complete ranking array."""
                             team_o = sum(not p.fainted for p in b.opponent_team.values())
                             v = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)  # 0..100
                             node.hp_diff = float(v) # v in 0...100
+                            assert 0.0 <= node.hp_diff <= 100.0, f"Invalid heuristic: {node.hp_diff}"
 
                             # Cache
                             depth_remaining = self.K - node.depth
@@ -3301,6 +2992,7 @@ Score each action and return the complete ranking array."""
                             team_o = sum(not p.fainted for p in b.opponent_team.values())
                             v = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)  # 0..100
                             node.hp_diff = float(v) # v in 0...100
+                            assert 0.0 <= node.hp_diff <= 100.0, f"Invalid heuristic: {node.hp_diff}"
 
                             # Cache
                             depth_remaining = self.K - node.depth
