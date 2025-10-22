@@ -246,7 +246,8 @@ def get_llm_player(args,
                        temp_action=getattr(args, 'temp_action', None),
                        mt_action=getattr(args, 'mt_action', None),
                        temp_expand=getattr(args, 'temp_expand', None),
-                       mt_expand=getattr(args, 'mt_expand', None))
+                       mt_expand=getattr(args, 'mt_expand', None),
+                       profile=getattr(args, 'profile', False))
     elif 'pokechamp' in name:
         return LLMPlayer(battle_format=battle_format,
                        api_key=KEY,
@@ -268,7 +269,8 @@ def get_llm_player(args,
                        temp_action=getattr(args, 'temp_action', None),
                        mt_action=getattr(args, 'mt_action', None),
                        temp_expand=getattr(args, 'temp_expand', None),
-                       mt_expand=getattr(args, 'mt_expand', None))
+                       mt_expand=getattr(args, 'mt_expand', None),
+                       profile=getattr(args, 'profile', False))
     else:
         # Try to find a custom bot in the bots folder
         custom_bot_class = get_custom_bot_class(name)

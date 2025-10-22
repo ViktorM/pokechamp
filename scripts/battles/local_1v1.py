@@ -72,6 +72,7 @@ parser.add_argument("--battle_format", default="gen9ou", choices=[
 parser.add_argument("--log_dir", type=str, default="./battle_log/one_vs_one")
 parser.add_argument("--N", type=int, default=1)
 parser.add_argument("--verbose", action="store_true", help="Show detailed turn-by-turn battle information")
+parser.add_argument("--profile", action="store_true", help="Show timing breakdown for minimax (without verbose debug output)")
 parser.add_argument("--max_tokens", type=int, default=300, help="Default max tokens for both players")
 parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
 parser.add_argument("--player_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (player)")

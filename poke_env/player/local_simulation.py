@@ -1438,7 +1438,6 @@ class LocalSim():
         #     const bondModifier = self.battle.gen > 6 ? 0.25 : 0.5;
         #     self.battle.debug(`Parental Bond modifier: ${bondModifier}`);
         #     baseDamage = self.battle.modify(baseDamage, bondModifier);
-        
 
         # weather modifier
         # baseDamage = self.battle.runEvent('WeatherModifyDamage', pokemon, target, move, baseDamage);
@@ -1474,16 +1473,13 @@ class LocalSim():
         if (type != '???'):
             if type.name in [type_1, type_2]:
                 stab = pokemon.stab_multiplier
-                
-        
+
         ## TODO: change stab based on tera    
         #tera_stab = 1
         #if type.name in [type_1, type_2]:
-            
 
         baseDamage *= stab
         # print(f'stab {move.id} {stab} {baseDamage}')
-        
 
         # types
         opponent_type_list = []
@@ -1542,7 +1538,6 @@ class LocalSim():
             baseDamage *= 1.25
         if target.ability == 'wonderguard' and not (extreme_effective_type_list or effective_type_list):
             baseDamage *= 0
-        
 
         # print(f'type {baseDamage}')
 
