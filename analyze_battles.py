@@ -21,15 +21,14 @@ def load_data(log_dir='battle_log/ladder'):
     # Load per-move metrics
     df = pd.read_csv(metrics_path)
     
-    # Check if algorithm column exists (for backward compatibility)
-    if 'algorithm' not in df.columns:
-        # If no algorithm column, assume 'io' for all entries
-        df['algorithm'] = 'io'
-        # Reorder columns to put algorithm after backend
-        cols = df.columns.tolist()
-        backend_idx = cols.index('backend')
-        cols.insert(backend_idx + 1, cols.pop(cols.index('algorithm')))
-        df = df[cols]
+    # Require proper logging format
+    required_columns = ['battle_tag', 'turn', 'backend', 'algorithm', 'player_role', 'player_username']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if missing_columns:
+        print(f"Error: Old log format detected. Missing columns: {missing_columns}")
+        print("Please regenerate logs with the updated logging system.")
+        return None, None
     
     # Create combined model+algo identifier
     df['model_algo'] = df['backend'] + ' (' + df['algorithm'] + ')'
@@ -38,8 +37,21 @@ def load_data(log_dir='battle_log/ladder'):
     battles = None
     if os.path.exists(summary_path):
         battles = pd.read_csv(summary_path, header=None)
-        battles.columns = ['battle_id', 'won', 'turns', 'avg_latency', 'total_moves', 
-                          'json_errors', 'switches', 'timeouts', 'final_score', 'extra']
+        
+        # Require new format with player info (17 columns)
+        if len(battles.columns) != 17:
+            print(f"Error: Old summary format detected. Expected 17 columns, got {len(battles.columns)}")
+            print("Please regenerate logs with the updated logging system.")
+            return df, None
+        
+        battles.columns = ['battle_id', 'player_role', 'backend', 'algorithm', 
+                          'player_username', 'won', 'turns', 'total_moves', 'avg_latency',
+                          'llm_calls', 'json_errors', 'switches', 'timeouts', 'avoided', 
+                          'osc', 'prog_trend', 'belief_entropy_trend']
+            
+        # 'won' column is already 1 for win, 0 for loss (from battle.won)
+        # Add player_index based on row order within each battle
+        battles['player_index'] = battles.groupby('battle_id').cumcount()
     
     return df, battles
 
@@ -137,128 +149,95 @@ def analyze_battle_outcomes(battles, df):
     print("="*60)
     
     # Each battle has 2 rows (one per player)
-    # Group by battle_id to get unique battles
-    unique_battles = battles.groupby('battle_id').agg({
-        'won': 'sum',  # Should always be 1 (one winner per battle)
-        'turns': 'mean',
-        'avg_latency': 'mean',
-        'total_moves': 'sum',
-        'json_errors': 'sum',
-        'switches': 'sum',
-        'timeouts': 'sum',
-        'final_score': 'mean'
-    }).reset_index()
-    
-    total_battles = len(unique_battles)
+    total_battles = len(battles['battle_id'].unique())
     
     print(f"\nTotal Battles: {total_battles}")
     print(f"Total Rows in CSV: {len(battles)} (2 per battle)")
     
-    # Now analyze by backend
+    # Now analyze by backend+algorithm combination
     print("\n" + "="*60)
-    print("WIN RATE BY BACKEND")
+    print("WIN RATE BY BACKEND+ALGORITHM")
     print("="*60)
     
-    # Create a mapping of battle_tag to model_algo from metrics
-    battle_to_model = df.groupby('battle_tag')['model_algo'].first().to_dict()
+    backend_algo_performance = {}
     
-    # Add model_algo to battles dataframe
-    battles['model_algo'] = battles['battle_id'].map(battle_to_model)
+    # Use explicit backend+algorithm from battle summary
+    for idx, row in battles.iterrows():
+        if pd.notna(row['backend']) and pd.notna(row['algorithm']):
+            model_algo = f"{row['backend']} ({row['algorithm']})"
+            
+            if model_algo not in backend_algo_performance:
+                backend_algo_performance[model_algo] = {'battles': 0, 'wins': 0}
+            
+            backend_algo_performance[model_algo]['battles'] += 1
+            if row['won'] == 1:
+                backend_algo_performance[model_algo]['wins'] += 1
     
-    # Group by actual model+algo
-    model_stats = []
-    for model_algo in sorted(battles['model_algo'].unique()):
-        if pd.isna(model_algo):
-            continue
-            
-        model_battles = battles[battles['model_algo'] == model_algo]
-        if len(model_battles) > 0:
-            # Count UNIQUE battles (each battle has 2 rows)
-            unique_model_battles = model_battles.groupby('battle_id').first()
-            total = len(unique_model_battles)
-            wins = unique_model_battles['won'].sum()
-            win_rate = wins / total if total > 0 else 0
-            avg_latency = model_battles['avg_latency'].mean()  # Use all rows for latency avg
-            
-            model_stats.append({
-                'model_algo': model_algo,
-                'battles': total,
-                'wins': wins,
-                'win_rate': win_rate,
-                'avg_latency': avg_latency
-            })
-            
-            print(f"\n{model_algo}:")
-            print(f"  Battles: {total}")
-            print(f"  Wins: {wins}")
-            print(f"  Win Rate: {win_rate:.1%}")
+    # Print results
+    for algo, stats in sorted(backend_algo_performance.items()):
+        win_rate = stats['wins'] / stats['battles'] if stats['battles'] > 0 else 0
+        print(f"\n{algo}:")
+        print(f"  Battles played: {stats['battles']}")
+        print(f"  Wins: {stats['wins']}")
+        print(f"  Win Rate: {win_rate:.1%}")
+        
+        # Also show average latency from moves data
+        algo_moves = df[df['model_algo'] == algo]
+        if len(algo_moves) > 0:
+            avg_latency = algo_moves['latency_ms'].mean()
             print(f"  Avg Latency: {avg_latency:.1f}ms")
     
-    # Analyze statistics PER MODEL
-    print("\n\nPER-MODEL DETAILED STATISTICS:")
+    # Show all head-to-head matchups
+    print("\n" + "="*60)
+    print("HEAD-TO-HEAD MATCHUPS")
     print("="*60)
     
-    for model_algo in sorted(battles['model_algo'].unique()):
-        if pd.isna(model_algo):
-            continue
-            
-        group_battles = battles[battles['model_algo'] == model_algo]
-        if len(group_battles) > 0:
-            # Count UNIQUE battles (each battle has 2 rows)
-            unique_group_battles = group_battles.groupby('battle_id').first()
-            
-            print(f"\n{model_algo}:")
-            print(f"{'Metric':<25} {'Value':>15}")
-            print("-" * 42)
-            
-            metrics = [
-                ('Total Battles', len(unique_group_battles)),
-                ('Wins', unique_group_battles['won'].sum()),
-                ('Win Rate', f"{unique_group_battles['won'].mean():.1%}"),
-                ('Avg Latency (ms)', f"{group_battles['avg_latency'].mean():.1f}"),
-                ('Avg Turns per Game', f"{group_battles['turns'].mean():.1f}"),
-                ('Avg Switches per Game', f"{group_battles['switches'].mean():.1f}"),
-                ('Total JSON Errors', group_battles['json_errors'].sum()),
-                ('Total Timeouts', group_battles['timeouts'].sum()),
-                ('Games with Timeouts', len(unique_group_battles[unique_group_battles['timeouts'] > 0])),
-                ('Min Latency (ms)', f"{group_battles['avg_latency'].min():.1f}"),
-                ('Max Latency (ms)', f"{group_battles['avg_latency'].max():.1f}"),
-                ('Latency Std Dev', f"{group_battles['avg_latency'].std():.1f}")
-            ]
-            
-            for label, value in metrics:
-                if isinstance(value, (int, float)):
-                    print(f"{label:<25} {value:>15}")
-                else:
-                    print(f"{label:<25} {value:>15}")
-            
-            # Win/Loss breakdown for this model
-            wins = group_battles[group_battles['won'] == 1]
-            losses = group_battles[group_battles['won'] == 0]
-            
-            if len(wins) > 0 and len(losses) > 0:
-                print(f"\n  Win vs Loss Comparison for {model_algo}:")
-                print(f"  {'Metric':<20} {'When Win':>12} {'When Lose':>12}")
-                print("  " + "-" * 46)
-                
-                comparison_metrics = [
-                    ('Avg Turns', 'turns'),
-                    ('Avg Latency (ms)', 'avg_latency'),
-                    ('Switches', 'switches')
-                ]
-                
-                for label, col in comparison_metrics:
-                    win_val = wins[col].mean() if len(wins) > 0 else 0
-                    loss_val = losses[col].mean() if len(losses) > 0 else 0
-                    print(f"  {label:<20} {win_val:>12.1f} {loss_val:>12.1f}")
+    # Build matchup statistics from battle data
+    matchup_stats = {}
     
-    # Timeout analysis
-    timeout_battles = battles[battles['timeouts'] > 0]
-    if len(timeout_battles) > 0:
-        num_timeout_battles = len(timeout_battles.groupby('battle_id'))
-        print(f"\n\nTimeout Analysis:")
-        print(f"Battles with timeouts: {num_timeout_battles} ({num_timeout_battles/total_battles*100:.1f}%)")
-        print(f"Win rate when you timeout: {timeout_battles['won'].mean():.1%}")
+    for battle_id in battles['battle_id'].unique():
+        battle_rows = battles[battles['battle_id'] == battle_id]
+        
+        if len(battle_rows) == 2:
+            algos = []
+            for idx, row in battle_rows.iterrows():
+                if pd.notna(row['backend']) and pd.notna(row['algorithm']):
+                    model_algo = f"{row['backend']} ({row['algorithm']})"
+                    algos.append((model_algo, row['won']))
+            
+            if len(algos) == 2:
+                # Sort for consistent key
+                sorted_algos = sorted([algos[0][0], algos[1][0]])
+                matchup_key = f"{sorted_algos[0]} vs {sorted_algos[1]}"
+                
+                if matchup_key not in matchup_stats:
+                    matchup_stats[matchup_key] = {
+                        'battles': 0,
+                        'algo1_wins': 0,
+                        'algo2_wins': 0,
+                        'algo1': sorted_algos[0],
+                        'algo2': sorted_algos[1]
+                    }
+                
+                matchup_stats[matchup_key]['battles'] += 1
+                
+                # Determine winner
+                for algo, won in algos:
+                    if won == 1:
+                        if algo == sorted_algos[0]:
+                            matchup_stats[matchup_key]['algo1_wins'] += 1
+                        else:
+                            matchup_stats[matchup_key]['algo2_wins'] += 1
+    
+    # Print all matchups
+    for matchup, stats in sorted(matchup_stats.items()):
+        print(f"\n{matchup}:")
+        print(f"  Total battles: {stats['battles']}")
+        print(f"  {stats['algo1']} wins: {stats['algo1_wins']}")
+        print(f"  {stats['algo2']} wins: {stats['algo2_wins']}")
+        algo1_winrate = stats['algo1_wins'] / stats['battles'] * 100 if stats['battles'] > 0 else 0
+        print(f"  {stats['algo1']} win rate: {algo1_winrate:.1f}%")
+
 
 def analyze_move_patterns(df):
     """Analyze move and switch patterns."""
@@ -350,7 +329,8 @@ def main():
     
     print(f"\nLoaded {len(df)} move records")
     if battles is not None:
-        print(f"Loaded {len(battles)} battle summaries")
+        num_battles = len(battles['battle_id'].unique())
+        print(f"Loaded {num_battles} battles ({len(battles)} summary rows, 2 per battle)")
     
     # Run analyses
     analyze_model_performance(df)
@@ -409,11 +389,16 @@ def main():
             recommended_tokens = int(current_tokens * 0.75)
             print(f"  💡 Reduce max_tokens from {current_tokens} to {recommended_tokens}")
     
-    # Battle length insight
-    if battles is not None:
-        avg_turns = battles['turns'].mean()
-        if avg_turns > 50:
-            print(f"\n💡 Long battles detected (avg {avg_turns:.0f} turns) - consider more aggressive strategies")
+    # Battle length statistics
+    if battles is not None and 'turns' in battles.columns:
+        print("\n📊 BATTLE LENGTH STATISTICS:")
+        print(f"  Average turns: {battles['turns'].mean():.1f}")
+        print(f"  Min turns: {int(battles['turns'].min())}")
+        print(f"  Max turns: {int(battles['turns'].max())}")
+        print(f"  Median turns: {battles['turns'].median():.1f}")
+        
+        if battles['turns'].mean() > 50:
+            print(f"\n💡 Long battles detected (avg {battles['turns'].mean():.0f} turns) - consider more aggressive strategies")
     
     print("\n" + "="*60)
 

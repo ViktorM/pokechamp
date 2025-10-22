@@ -17,53 +17,217 @@ from poke_env.player.battle_order import BattleOrder
 from poke_env.player.local_simulation import LocalSim
 
 
+@dataclass(frozen=True)
+class TTKey:
+    """
+    Transposition table key for minimax caching.
+    
+    Only includes stable, value-driving features.
+    Excludes turn_number to allow transposition across turns.
+    HP coarse-grained to deciles to improve hit rate.
+    """
+    active_hp_deciles: Tuple[int, int]              # (us, opp), 0..10
+    active_species: Tuple[str, str]                 # normalized species ids
+    fainted_count: Tuple[int, int]                  # (our_fainted, opp_fainted)
+    our_side: Tuple[Tuple[str, int], ...]           # hazards/screens on our side
+    opp_side: Tuple[Tuple[str, int], ...]           # hazards/screens on opp side
+    field: Tuple[str, ...]                          # weather/terrain (normalized)
+    boosts: Tuple[int, int, int, int, int, int, int, int, int, int]  # stat boosts (10 values, no accuracy)
+    tera_flags: Tuple[int, int]                     # (we_tera_used, opp_tera_used)
+
+
+def normalize_side(side_dict) -> Tuple[Tuple[str, int], ...]:
+    """Normalize side conditions to sorted tuples with bucketed counters."""
+    if not side_dict:
+        return ()
+    
+    def _bucket(n: int) -> int:
+        """Bucket counters to reduce state space: 0, 1-2, 3+"""
+        if n <= 0: return 0
+        if n <= 2: return 1
+        return 2
+    
+    items = []
+    for k, v in side_dict.items():
+        name = getattr(k, "name", str(k)).lower().replace(" ", "").replace("-", "")
+        items.append((name, _bucket(int(v))))
+    return tuple(sorted(items))
+
+
+def normalize_field(battle) -> Tuple[str, ...]:
+    """Normalize weather/terrain/field effects to sorted tuple of names."""
+    xs = []
+    try:
+        if getattr(battle, "weather", None):
+            weather_name = getattr(battle.weather, "name", str(battle.weather)).lower().replace(" ", "").replace("-", "")
+            if weather_name and weather_name != "none":
+                xs.append(weather_name)
+    except:
+        pass
+    
+    try:
+        if getattr(battle, "fields", None):
+            for k, v in getattr(battle, "fields", {}).items():
+                if v:
+                    field_name = getattr(k, "name", str(k)).lower().replace(" ", "").replace("-", "")
+                    xs.append(field_name)
+    except:
+        pass
+    
+    return tuple(sorted(xs))
+
+
+def canonical_action(order, tera: bool = False) -> str:
+    """
+    Canonicalize action to stable string for cache key.
+    
+    Examples: "M:shadowball", "S:zapdos", "M:icespinner+tera"
+    """
+    if order is None:
+        return "none"
+    
+    # Move action
+    if hasattr(order, 'move') and order.move:
+        move_id = getattr(order.move, "id", "").lower().replace(" ", "").replace("-", "")
+        suffix = "+tera" if tera else ""
+        return f"M:{move_id}{suffix}"
+    
+    # Switch action
+    if hasattr(order, 'pokemon') and order.pokemon:
+        species = getattr(order.pokemon, "species", "").lower().replace(" ", "").replace("-", "")
+        return f"S:{species}"
+    
+    return "none"
+
+
 @dataclass
 class BattleStateHash:
-    """Lightweight battle state representation for hashing and caching."""
-    active_pokemon_hp: Tuple[int, int]  # (player, opponent)
+    """
+    OLD reference implementation - kept for comparison.
+    
+    Issues with this approach:
+    - Includes turn_number (prevents transpositions)
+    - Uses exact HP (too precise, poor cache hits)
+    - Stringifies weather/terrain (repr noise)
+    
+    Use TTKey instead for actual caching.
+    """
+    active_pokemon_hp: Tuple[int, int]  # Exact HP percentage
     active_pokemon_species: Tuple[str, str]
-    team_remaining: Tuple[int, int]  # remaining Pokemon count
-    turn_number: int
-    weather: str
-    terrain: str
+    team_remaining: Tuple[int, int]
+    turn_number: int  # <-- Problem: prevents transpositions
+    weather: str  # <-- Problem: string repr noise
+    terrain: str  # <-- Problem: string repr noise
+    hazards: Tuple[str, ...]
+    boosts: Tuple[int, int, int, int, int, int, int, int, int, int, int, int]
     
     def __hash__(self):
         return hash((
             self.active_pokemon_hp,
-            self.active_pokemon_species, 
+            self.active_pokemon_species,
             self.team_remaining,
             self.turn_number,
             self.weather,
-            self.terrain
+            self.terrain,
+            self.hazards,
+            self.boosts
         ))
 
 
-def create_battle_state_hash(battle: Battle) -> BattleStateHash:
-    """Create a lightweight hash representation of battle state."""
+def mk_ttkey(battle: Battle) -> TTKey:
+    """
+    Create a transposition table key for caching.
+    
+    Excludes turn_number to allow transpositions.
+    Uses coarse-grained HP (deciles) to improve hit rate.
+    Normalizes all fields to avoid string noise.
+    """
     try:
-        player_hp = battle.active_pokemon.current_hp_fraction if battle.active_pokemon else 0
-        opp_hp = battle.opponent_active_pokemon.current_hp_fraction if battle.opponent_active_pokemon else 0
+        u = battle.active_pokemon
+        o = battle.opponent_active_pokemon
         
-        player_species = battle.active_pokemon.species if battle.active_pokemon else ""
-        opp_species = battle.opponent_active_pokemon.species if battle.opponent_active_pokemon else ""
+        # HP as deciles (0-10) for better cache hits
+        active_hp_deciles = (
+            int(round((u.current_hp_fraction if u else 0) * 10)),
+            int(round((o.current_hp_fraction if o else 0) * 10))
+        )
         
-        player_remaining = len([p for p in battle.team.values() if not p.fainted])
-        opp_remaining = len([p for p in battle.opponent_team.values() if not p.fainted])
+        # Normalized species
+        active_species = (
+            (u.species or "").lower().replace(" ", "").replace("-", ""),
+            (o.species or "").lower().replace(" ", "").replace("-", "")
+        )
         
-        weather = str(battle.weather) if hasattr(battle, 'weather') else ""
-        terrain = str(battle.fields) if hasattr(battle, 'fields') else ""
+        # Fainted count (not remaining - more stable)
+        fainted_count = (
+            sum(1 for p in battle.team.values() if p.fainted),
+            sum(1 for p in battle.opponent_team.values() if p.fainted)
+        )
         
-        return BattleStateHash(
-            active_pokemon_hp=(int(player_hp * 100), int(opp_hp * 100)),
-            active_pokemon_species=(player_species, opp_species),
-            team_remaining=(player_remaining, opp_remaining),
-            turn_number=battle.turn,
-            weather=weather,
-            terrain=terrain
+        # Normalize side conditions
+        our_side = normalize_side(battle.side_conditions)
+        opp_side = normalize_side(battle.opponent_side_conditions)
+        
+        # Normalize field effects
+        field = normalize_field(battle)
+        
+        # Extract stat boosts with bucketing for better TT reuse
+        def _boost_bucket(z: int) -> int:
+            """Bucket boosts: <=-2, -1, 0, 1-2, 3+"""
+            if z <= -2: return -2
+            if z == -1: return -1
+            if z == 0: return 0
+            if z <= 2: return 1
+            return 2
+        
+        try:
+            player_boosts = u.boosts if u else {}
+            opp_boosts = o.boosts if o else {}
+            
+            # Only track value-driving boosts (drop accuracy for most gens)
+            boosts = (
+                _boost_bucket(player_boosts.get('atk', 0)), 
+                _boost_bucket(player_boosts.get('def', 0)),
+                _boost_bucket(player_boosts.get('spa', 0)), 
+                _boost_bucket(player_boosts.get('spd', 0)),
+                _boost_bucket(player_boosts.get('spe', 0)),
+                _boost_bucket(opp_boosts.get('atk', 0)), 
+                _boost_bucket(opp_boosts.get('def', 0)),
+                _boost_bucket(opp_boosts.get('spa', 0)), 
+                _boost_bucket(opp_boosts.get('spd', 0)),
+                _boost_bucket(opp_boosts.get('spe', 0))
+            )
+        except:
+            boosts = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        
+        # Tera flags
+        try:
+            tera_flags = (
+                int(getattr(u, "terastallized", False) if u else False or not battle.can_tera),
+                int(getattr(o, "terastallized", False) if o else False or not battle.opponent_can_tera)
+            )
+        except:
+            tera_flags = (0, 0)
+        
+        return TTKey(
+            active_hp_deciles=active_hp_deciles,
+            active_species=active_species,
+            fainted_count=fainted_count,
+            our_side=our_side,
+            opp_side=opp_side,
+            field=field,
+            boosts=boosts,
+            tera_flags=tera_flags
         )
     except Exception as e:
-        # Fallback hash based on turn number only
-        return BattleStateHash((0, 0), ("", ""), (0, 0), battle.turn, "", "")
+        # Fallback to minimal key
+        return TTKey((0, 0), ("", ""), (0, 0), (), (), (), (0, 0, 0, 0, 0, 0, 0, 0, 0, 0), (0, 0))
+
+
+# Backward compatibility alias
+def create_battle_state_hash(battle: Battle) -> TTKey:
+    """Legacy name - redirects to mk_ttkey."""
+    return mk_ttkey(battle)
 
 
 class LocalSimPool:
@@ -140,22 +304,25 @@ class MinimaxCache:
     """Cache for minimax evaluation results to avoid recomputation."""
     
     def __init__(self, max_size: int = 1000):
-        self._cache: Dict[Tuple[BattleStateHash, str, str], float] = {}
+        # Store (value, depth) to avoid using shallow eval for deeper nodes
+        self._cache: Dict[Tuple[BattleStateHash, str, str], Tuple[float, int]] = {}
         self._max_size = max_size
         self._hits = 0
         self._misses = 0
     
-    def get_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str) -> Optional[float]:
+    def get_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str, min_depth: int = 0) -> Optional[float]:
         """Get cached evaluation for a battle state + action combination."""
         key = (battle_state, player_action, opp_action)
         if key in self._cache:
-            self._hits += 1
-            return self._cache[key]
-        else:
-            self._misses += 1
-            return None
+            val, depth = self._cache[key]
+            if depth >= min_depth:
+                self._hits += 1
+                return val
+            # treat as miss if shallower than required
+        self._misses += 1
+        return None
     
-    def set_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str, value: float):
+    def set_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str, value: float, depth: int):
         """Cache an evaluation result."""
         key = (battle_state, player_action, opp_action)
         
@@ -165,7 +332,7 @@ class MinimaxCache:
             for item in items_to_remove:
                 del self._cache[item]
         
-        self._cache[key] = value
+        self._cache[key] = (value, depth)
     
     def clear(self):
         """Clear the cache."""
@@ -235,12 +402,19 @@ class MinimaxOptimizer:
     
     def __init__(self):
         self.sim_pool = LocalSimPool(initial_size=4)  # Larger pool for minimax
-        self.cache = MinimaxCache(max_size=2000)
+        self.cache = MinimaxCache(max_size=2000)  # (parent, action, opp) cache
+        self.state_value_cache: Dict[TTKey, Tuple[float, int]] = {}  # child state → (value, depth) cache
         self.stats = {
             'nodes_created': 0,
-            'cache_hits': 0,
+            'cache_hits': 0,  # Parent-action cache hits
             'pool_reuses': 0,
-            'total_time': 0.0
+            'total_time': 0.0,
+            'cache_stats': {
+                'state_value_hits': 0,
+                'state_value_misses': 0,
+                'parent_action_hits': 0,
+                'parent_action_misses': 0
+            }
         }
     
     def initialize(self, battle: Battle, **localsim_kwargs):
@@ -259,16 +433,48 @@ class MinimaxOptimizer:
         root.cleanup()
         self.sim_pool.release_all()
     
-    def get_cached_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str) -> Optional[float]:
+    def evaluate_leaf(self, node: OptimizedSimNode) -> float:
+        """Heuristic leaf eval (fast, bounded 0..100)."""
+        b = node.simulation.battle
+        hp_p = int((b.active_pokemon.current_hp_fraction or 0) * 100)
+        hp_o = int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100)
+        team_p = len([p for p in b.team.values() if not p.fainted])
+        team_o = len([p for p in b.opponent_team.values() if not p.fainted])
+        return fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+    
+    def get_cached_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str, min_depth: int = 0) -> Optional[float]:
         """Try to get cached evaluation for this state."""
-        result = self.cache.get_evaluation(battle_state, player_action, opp_action)
+        result = self.cache.get_evaluation(battle_state, player_action, opp_action, min_depth=min_depth)
         if result is not None:
-            self.stats['cache_hits'] += 1
+            self.stats['cache_hits'] += 1  # Legacy counter
+            self.stats['cache_stats']['parent_action_hits'] += 1
+        else:
+            self.stats['cache_stats']['parent_action_misses'] += 1
         return result
     
-    def cache_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str, value: float):
+    def cache_evaluation(self, battle_state: BattleStateHash, player_action: str, opp_action: str, value: float, depth: int = 0):
         """Cache an evaluation result."""
-        self.cache.set_evaluation(battle_state, player_action, opp_action, value)
+        self.cache.set_evaluation(battle_state, player_action, opp_action, value, depth)
+    
+    def get_state_value(self, key: TTKey, min_depth: int = 0) -> Optional[float]:
+        """Get cached value for a child state (post-step) if deep enough."""
+        v = self.state_value_cache.get(key)
+        if v is None:
+            self.stats['cache_stats']['state_value_misses'] += 1
+            return None
+        val, depth = v
+        if depth >= min_depth:
+            self.stats['cache_stats']['state_value_hits'] += 1
+            return val
+        # Too shallow; treat as miss for this query
+        self.stats['cache_stats']['state_value_misses'] += 1
+        return None
+    
+    def cache_state_value(self, key: TTKey, value: float, depth: int) -> None:
+        """Cache a state value (post-step) with depth info."""
+        cur = self.state_value_cache.get(key)
+        if (cur is None) or (depth > cur[1]):  # keep the deepest eval
+            self.state_value_cache[key] = (value, depth)
     
     def get_performance_stats(self) -> Dict[str, Any]:
         """Get performance statistics."""
@@ -288,7 +494,11 @@ class MinimaxOptimizer:
             'cache_stats': {
                 'hits': cache_hits,
                 'misses': cache_misses,
-                'hit_rate': cache_hit_rate
+                'hit_rate': cache_hit_rate,
+                'state_value_hits': self.stats['cache_stats']['state_value_hits'],
+                'state_value_misses': self.stats['cache_stats']['state_value_misses'],
+                'parent_action_hits': self.stats['cache_stats']['parent_action_hits'],
+                'parent_action_misses': self.stats['cache_stats']['parent_action_misses']
             },
             'total_time': self.stats['total_time']
         }
@@ -299,9 +509,16 @@ class MinimaxOptimizer:
             'nodes_created': 0,
             'cache_hits': 0,
             'pool_reuses': 0,
-            'total_time': 0.0
+            'total_time': 0.0,
+            'cache_stats': {
+                'state_value_hits': 0,
+                'state_value_misses': 0,
+                'parent_action_hits': 0,
+                'parent_action_misses': 0
+            }
         }
         self.cache.clear()
+        self.state_value_cache.clear()  # Clear state-value cache
         self.sim_pool.reset_metrics()  # Reset pool reuse counter
 
 

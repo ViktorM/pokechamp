@@ -8,6 +8,56 @@ from poke_env.environment.pokemon import Pokemon
 from poke_env.environment.side_condition import SideCondition
 from poke_env.player.local_simulation import LocalSim, move_type_damage_wrapper
 
+
+def approx_token_count(text: str) -> int:
+    """
+    Approximate token count for text.
+    Simple heuristic: 1 token ≈ 4 characters.
+    """
+    return len(text) // 4
+
+
+def prune_micro(micro_prompt: str, keep_active: bool = True, top_k_switches: int = 2) -> str:
+    """
+    Prune micro-strategy tables to fit token budget.
+    
+    Args:
+        micro_prompt: The full micro-strategy prompt
+        keep_active: Whether to keep active Pokemon details
+        top_k_switches: Number of switch options to keep
+    
+    Returns:
+        Pruned micro prompt
+    """
+    lines = micro_prompt.split('\n')
+    pruned_lines = []
+    
+    # Keep header and active Pokemon info
+    in_switch_section = False
+    switches_kept = 0
+    
+    for line in lines:
+        if not line.strip():
+            pruned_lines.append(line)
+            continue
+            
+        # Detect switch section
+        if 'switch' in line.lower() or 'available pokemon' in line.lower():
+            in_switch_section = True
+        
+        # Keep active Pokemon details always
+        if keep_active and ('current pokemon' in line.lower() or not in_switch_section):
+            pruned_lines.append(line)
+        elif in_switch_section:
+            # Limit number of switch options
+            if switches_kept < top_k_switches or ':' not in line:
+                pruned_lines.append(line)
+                if ': ' in line and 'turns to KO' in line:  # Count switch entries
+                    switches_kept += 1
+    
+    return '\n'.join(pruned_lines)
+
+
 def get_turn_summary(sim: LocalSim,
                      battle: Battle,
                      n_turn: int=5
@@ -676,10 +726,16 @@ def prompt_translate(sim: LocalSim,
                     battle: Battle,
                     return_actions=False
                     ) -> str:
-    battle_prompt = get_turn_summary(sim, battle, n_turn=16)
+    # Gen-aware token budget: Gen9 uses fewer turns (more complex state)
+    n_turn = 6 if sim.gen.gen == 9 else 8
+    battle_prompt = get_turn_summary(sim, battle, n_turn=n_turn)
     macro_prompt = get_macro_strat(sim, battle)
     # print(f'macro prompt:\n{macro_prompt}')
     micro_prompt = get_micro_strat(sim, battle)
+    
+    # Gate micro tables based on token budget
+    if approx_token_count(micro_prompt) > 700:
+        micro_prompt = prune_micro(micro_prompt, keep_active=True, top_k_switches=2)
     # print(f'micro prompt:\n{micro_prompt}')
     action_prompt_move, action_prompt_switch = get_avail_actions(sim, battle)
 
@@ -741,8 +797,6 @@ def prompt_translate(sim: LocalSim,
         # #input()
 
     return system_prompt, state_prompt, state_action_prompt
-
-
 
 
 def state_translate(sim: LocalSim, 
@@ -1306,18 +1360,19 @@ def state_translate2(sim: LocalSim,
                     return_actions=False,
                     return_choices=False,
                     ):
-    # init default to high elo player
-    player_elo, opponent_elo = 1800, 1800
+    # Get real Elo values if available; otherwise omit from prompt
+    player_elo, opponent_elo = None, None
     for player in battle._players:
         if player['rating'] != '':
             if battle._player_role == player['player']:
                 player_elo = player['rating']
             else:
                 opponent_elo = player['rating']
-    player_elo, opponent_elo = 1800, 1200
+    # Don't inject artificial bias - use real values or None
     
-    # get turn history
-    battle_prompt = get_turn_summary(sim, battle, n_turn=16)
+    # get turn history - Gen-aware token budget
+    n_turn = 6 if sim.gen.gen == 9 else 8
+    battle_prompt = get_turn_summary(sim, battle, n_turn=n_turn)
 
     # number of fainted pokemon
     opponent_fainted_num = 0
@@ -1668,8 +1723,13 @@ def state_translate2(sim: LocalSim,
             " Compare the speeds of your pokemon to the opposing pokemon, which determines who take the move first."
             " Consider the defense state and type-resistance of your pokemon when its speed is lower than the opposing pokemon."
             " Consider the move-type advantage of your pokemon pokemon when its speed is higher than the opposing pokemon."
-            f" Player elo is {player_elo}. Player is P2. Opponent elo is {opponent_elo}. Opponent is P1.\n"
-            )
+        )
+        
+        # Only include Elo info if available (don't inject bias)
+        if player_elo is not None and opponent_elo is not None:
+            system_prompt += f" Player elo is {player_elo}. Opponent elo is {opponent_elo}.\n"
+        else:
+            system_prompt += "\n"
 
         state_prompt = battle_prompt + opponent_prompt + switch_prompt
         state_action_prompt = action_prompt + action_prompt_switch
@@ -1683,8 +1743,13 @@ def state_translate2(sim: LocalSim,
             " When face to a opponent is boosting or has already boosted its attack/special attack/speed, knock it out as soon as possible, even sacrificing your pokemon."
             " if choose to switch, you forfeit to take a move this turn and the opposing pokemon will definitely move first. Therefore, you should pay attention to speed, type-resistance and defense of your switch-in pokemon to bear the damage from the opposing pokemon."
             " And If the switch-in pokemon has a slower speed then the opposing pokemon, the opposing pokemon will move twice continuously."
-            f" Player elo is {player_elo}. Player is P2. Opponent elo is {opponent_elo}. Opponent is P1.\n"
-            )
+        )
+        
+        # Only include Elo info if available (don't inject bias)
+        if player_elo is not None and opponent_elo is not None:
+            system_prompt += f" Player elo is {player_elo}. Opponent elo is {opponent_elo}.\n"
+        else:
+            system_prompt += "\n"
 
         system_prompt = system_prompt + sim.strategy
 

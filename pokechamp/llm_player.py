@@ -73,7 +73,11 @@ class LLMPlayer(Player):
                  log_level=None,
                  move_time_limit_s: float = None,
                  max_tokens: int = 300,
-                 reasoning_effort: str = "low"
+                 reasoning_effort: str = "low",
+                 temp_action: float = None,
+                 mt_action: int = None,
+                 temp_expand: float = None,
+                 mt_expand: int = None
                  ):
 
         super().__init__(battle_format=battle_format,
@@ -96,15 +100,18 @@ class LLMPlayer(Player):
         self.api_key = api_key
         self.prompt_algo = prompt_algo
         self.reasoning_effort = reasoning_effort
+        # Minimax leaf evaluation config (can be overridden)
+        self.minimax_llm_weight_midgame = 0.4  # 40% LLM in midgame  
+        self.minimax_llm_weight_endgame = 0.8  # 80% LLM in endgame
         
-        # Two-tier temperature and token settings
+        # Two-tier temperature and token settings with CLI override support
         # Tier 1: Action/Decision prompts (cold, structured JSON selection)
-        self.temp_action = 0.0        # For {"move": "X"} or {"switch": "Y"} - deterministic
-        self.mt_action = 16           # Minimal tokens for simple JSON
+        self.temp_action = temp_action if temp_action is not None else 0.0
+        self.mt_action = mt_action if mt_action is not None else 16
         
         # Tier 2: Expansion/Reasoning prompts (warmer, idea generation)
-        self.temp_expand = temperature  # Use CLI temperature for reasoning/brainstorming
-        self.mt_expand = max_tokens    # Use CLI max_tokens for expansion
+        self.temp_expand = temp_expand if temp_expand is not None else temperature
+        self.mt_expand = mt_expand if mt_expand is not None else max_tokens
         
         # Legacy compatibility - map to expand tier by default
         self.temperature = temperature
@@ -198,6 +205,127 @@ class LLMPlayer(Player):
                     return self.create_order(mon)
         except Exception:
             pass
+        return None
+    
+    def _robust_value(self, child_vals, opp_priors=None, eta=0.25):
+        """
+        Compute robust value for action considering opponent replies.
+        
+        Args:
+            child_vals: List of values for different opponent replies
+            opp_priors: Optional prior probabilities for opponent actions
+            eta: Weight on worst-case (0=mean, 1=pure minimax)
+        
+        Returns:
+            Risk-averse value mixing worst-case and expectation
+        """
+        if not child_vals:
+            return float('-inf')
+        
+        worst = min(child_vals)  # Adversarial (worst opponent reply)
+        
+        if opp_priors and len(opp_priors) == len(child_vals):
+            # Belief-mixed expectation
+            Z = sum(opp_priors) or 1.0
+            mean = sum(p * v for p, v in zip(opp_priors, child_vals)) / Z
+        else:
+            # Uniform expectation
+            mean = sum(child_vals) / len(child_vals)
+        
+        # Mix worst-case with expectation (eta controls risk aversion)
+        return (1 - eta) * mean + eta * worst
+    
+    def _should_use_minimax(self, battle: Battle, dmg_calc_turns: float) -> bool:
+        """
+        Deterministic heuristic to decide between damage calc and minimax.
+        
+        Uses a simple 2-3 rule based on turns-to-KO and speed order.
+        
+        Args:
+            battle: Current battle state
+            dmg_calc_turns: Turns to KO opponent with best damage calc move
+        
+        Returns:
+            True if should use minimax, False if damage calc is sufficient
+        """
+        try:
+            # Get opponent's best TTK against us
+            _, their_best_ttk = self.estimate_matchup(
+                None, battle,
+                battle.opponent_active_pokemon,
+                battle.active_pokemon,
+                is_opp=True
+            )
+        except:
+            their_best_ttk = float('inf')
+        
+        # Check if we move first (speed advantage)
+        try:
+            we_move_first = battle.active_pokemon.stats['spe'] > battle.opponent_active_pokemon.stats['spe']
+        except:
+            we_move_first = False
+        
+        # Calculate effective TTK accounting for speed
+        our_effective_ttk = dmg_calc_turns + (0 if we_move_first else 1)
+        
+        # Clear edge: we can KO in 1-2 turns and faster than opponent
+        clear_edge = (our_effective_ttk < their_best_ttk) and (dmg_calc_turns <= 2)
+        
+        if clear_edge:
+            # Damage calc is good enough
+            return False
+        else:
+            # Complex situation - use minimax
+            return True
+    
+    def legalize_choice(self, battle: Battle, choice: dict) -> Optional[BattleOrder]:
+        """
+        Robust normalizer to map LLM output to legal BattleOrder.
+        
+        Handles nickname/species/case mismatches.
+        
+        Args:
+            battle: Current battle state
+            choice: Dict like {"move": "X"} or {"switch": "Y"}
+        
+        Returns:
+            BattleOrder if legal, None otherwise
+        """
+        try:
+            # Normalize move selection
+            if "move" in choice:
+                want = choice["move"].replace(" ", "").replace("-", "").lower()
+                for mv in battle.available_moves:
+                    mv_id = mv.id.replace(" ", "").replace("-", "").lower()
+                    if mv_id == want:
+                        # Check for gimmick flags
+                        tera = choice.get("tera") in (True, "true", "True", 1)
+                        dmax = choice.get("dmax") in (True, "true", "True", 1)
+                        return self.create_order(mv, terastallize=tera, dynamax=dmax)
+                
+                # Log normalization failure
+                available_ids = [mv.id for mv in battle.available_moves]
+                print(f"⚠️  Move '{choice['move']}' not in legal moves: {available_ids}")
+                return None
+            
+            # Normalize switch selection
+            if "switch" in choice:
+                want = choice["switch"].replace(" ", "").replace("-", "").lower()
+                # Try species match (not nickname)
+                for mon in battle.available_switches:
+                    species = (mon.species or "").replace(" ", "").replace("-", "").lower()
+                    if species == want:
+                        return self.create_order(mon)
+                
+                # Log normalization failure
+                available_species = [mon.species for mon in battle.available_switches]
+                print(f"⚠️  Switch '{choice['switch']}' not in legal switches: {available_species}")
+                return None
+                
+        except Exception as e:
+            print(f"⚠️  legalize_choice failed: {e}")
+            return None
+        
         return None
     
     def _safe_default(self, battle: Battle) -> BattleOrder:
@@ -417,9 +545,21 @@ class LLMPlayer(Player):
         actions = [moves, switches]
         
 
-        gimmick_output_format = ''
-        if 'pokellmon' not in self.ps_client.account_configuration.username: # make sure we dont mess with pokellmon original strat
-            gimmick_output_format = f'{f' or {{"dynamax":"<move_name>"}}' if battle.can_dynamax else ''}{f' or {{"terastallize":"<move_name>"}}' if battle.can_tera else ''}'
+        # Determine gimmick availability as structured flags (not standalone actions)
+        tera_available = False
+        dmax_available = False
+        if 'pokellmon' not in self.ps_client.account_configuration.username:
+            if battle._data.gen == 9 and battle.can_tera:
+                tera_available = True
+            if battle._data.gen == 8 and battle.can_dynamax:
+                dmax_available = True
+        
+        # Build gimmick flags for JSON output (coupled with moves, not standalone)
+        gimmick_flags = ''
+        if tera_available:
+            gimmick_flags += ', "tera": true|false'
+        if dmax_available:
+            gimmick_flags += ', "dmax": true|false'
 
         if battle.active_pokemon.fainted or (len(battle.available_moves) == 0 and len(battle.available_switches) > 0 and not battle.trapped):
             # Pokemon is fainted or can't move but can switch (not trapped)
@@ -428,12 +568,12 @@ class LLMPlayer(Player):
             constraint_prompt_tot_1 = '''Generate top-k (k<=3) best switch options. Your output MUST be a JSON like:{"option_1":{"action":"switch","target":"<switch_pokemon_name>"}, ..., "option_k":{"action":"switch","target":"<switch_pokemon_name>"}}\n'''
             constraint_prompt_tot_2 = '''Select the best option from the following choices by considering their consequences: [OPTIONS]. Your output MUST be a JSON like:{"decision":{"action":"switch","target":"<switch_pokemon_name>"}}\n'''
         elif len(battle.available_switches) == 0 or battle.trapped:
-            constraint_prompt_io = f'''Choose the best action. Pick exactly one action. Your output MUST be a JSON like: {{"move":"<move_name>", "why":"<=20 tokens (optional)"}}{gimmick_output_format}. If low on budget, omit "why".\n'''
+            constraint_prompt_io = f'''Choose the best action. Pick exactly one action. Your output MUST be a JSON like: {{"move":"<move_name>"{gimmick_flags}, "why":"<=20 tokens (optional)"}}. If low on budget, omit "why". Set tera/dmax to true only if beneficial.\n'''
             constraint_prompt_cot = '''Choose the best action by thinking step by step. Your thought should no more than 4 sentences. Your output MUST be a JSON like: {"thought":"<step-by-step-thinking>", "move":"<move_name>"} or {"thought":"<step-by-step-thinking>"}\n'''
             constraint_prompt_tot_1 = '''Generate top-k (k<=3) best action options. Your output MUST be a JSON like: {"option_1":{"action":"<move>", "target":"<move_name>"}, ..., "option_k":{"action":"<move>", "target":"<move_name>"}}\n'''
             constraint_prompt_tot_2 = '''Select the best action from the following choices by considering their consequences: [OPTIONS]. Your output MUST be a JSON like:"decision":{"action":"<move>", "target":"<move_name>"}\n'''
         else:
-            constraint_prompt_io = f'''Choose the best action. Pick exactly one action. Your output MUST be a JSON like: {{"move":"<move_name>", "why":"<=20 tokens (optional)"}}{gimmick_output_format} or {{"switch":"<switch_pokemon_name>", "why":"<=20 tokens (optional)"}}. If low on budget, omit "why".\n'''
+            constraint_prompt_io = f'''Choose the best action. Pick exactly one action. Your output MUST be a JSON like: {{"move":"<move_name>"{gimmick_flags}, "why":"<=20 tokens (optional)"}} or {{"switch":"<switch_pokemon_name>", "why":"<=20 tokens (optional)"}}. If low on budget, omit "why". Set tera/dmax to true only if beneficial.\n'''
             constraint_prompt_cot = '''Choose the best action by thinking step by step. Your thought should no more than 4 sentences. Your output MUST be a JSON like: {"thought":"<step-by-step-thinking>", "move":"<move_name>"} or {"thought":"<step-by-step-thinking>", "switch":"<switch_pokemon_name>"}\n'''
             constraint_prompt_tot_1 = '''Generate top-k (k<=3) best action options. Your output MUST be a JSON like: {"option_1":{"action":"<move_or_switch>", "target":"<move_name_or_switch_pokemon_name>"}, ..., "option_k":{"action":"<move_or_switch>", "target":"<move_name_or_switch_pokemon_name>"}}\n'''
             constraint_prompt_tot_2 = '''Select the best action from the following choices by considering their consequences: [OPTIONS]. Your output MUST be a JSON like:"decision":{"action":"<move_or_switch>", "target":"<move_name_or_switch_pokemon_name>"}\n'''
@@ -569,7 +709,7 @@ class LLMPlayer(Player):
         if not os.path.exists(path):
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(
-                    'battle_tag,turn,backend,algorithm,latency_ms,json_ok,'
+                    'battle_tag,turn,backend,algorithm,player_role,player_username,latency_ms,json_ok,'
                     'fallback_reason,available_moves,available_switches,'
                     'action_kind,action_label,max_tokens,tokens_prompt,tokens_completion,'
                     'near_timeout,progress_score\n'
@@ -584,7 +724,9 @@ class LLMPlayer(Player):
             getattr(battle, 'battle_tag', ''),
             getattr(battle, 'turn', 0),
             self.backend,
-            self.prompt_algo,  # Add algorithm to the log
+            self.prompt_algo,
+            getattr(battle, 'player_role', ''),  # p1 or p2
+            self.username,  # player_username
             latency_ms,
             int(bool(json_ok)),
             fallback_reason,
@@ -660,16 +802,30 @@ class LLMPlayer(Player):
         osc = self._oscillation.get(bt, 0)
         prog = self._progress_scores.get(bt, [])
         prog_trend = (prog[-1] - prog[0]) if len(prog) >= 2 else 0
-        belief_entropy_trend = ''  # placeholder
+        
+        # Calculate additional useful statistics
+        json_errors = sum(1 for r in moves if not r[7])  # json_ok is at index 7
+        switches = sum(1 for r in moves if r[9] == 'switch')  # action_kind is at index 9
+        
+        # Calculate belief entropy trend (placeholder for now - can be enhanced later)
+        belief_entropy_trend = 0  # TODO: Calculate from Bayesian predictor if available
+        
         if self.log_dir:
             try:
                 with open(os.path.join(self.log_dir, 'metrics_summary.csv'), 'a') as f:
                     f.write(','.join(map(str, [
                         bt,
+                        getattr(battle, 'player_role', ''),  # p1 or p2
+                        self.backend,
+                        self.prompt_algo,
+                        self.username,  # player_username
                         int(battle.won),
-                        len(moves),
-                        f"{avg_ms:.1f}",
+                        getattr(battle, 'turn', 0),  # turns - actual battle length
+                        len(moves),  # total_moves - number of move records logged
+                        f"{avg_ms:.1f}",  # avg_latency
                         llm_calls,
+                        json_errors,
+                        switches,
                         timeouts,
                         avoided,
                         osc,
@@ -750,17 +906,32 @@ class LLMPlayer(Player):
                     print(f"Parsed JSON: {llm_action_json}")
                 next_action = None
 
-                dynamax = "dynamax" in llm_action_json.keys()
-                tera = "terastallize" in llm_action_json.keys()
+                # Check for gimmicks as structured flags (new format) or standalone keys (old format)
+                dynamax = False
+                tera = False
+                
+                # New format: {"move": "X", "dmax": true} or {"move": "X", "tera": true}
+                if "dmax" in llm_action_json:
+                    dynamax = llm_action_json["dmax"] in (True, "true", "True", 1)
+                if "tera" in llm_action_json:
+                    tera = llm_action_json["tera"] in (True, "true", "True", 1)
+                
+                # Old format (backward compat): {"dynamax": "move_name"} or {"terastallize": "move_name"}
+                if "dynamax" in llm_action_json:
+                    dynamax = True
+                if "terastallize" in llm_action_json:
+                    tera = True
+                
                 is_a_move = dynamax or tera
 
                 if "move" in llm_action_json.keys() or is_a_move:
-                    if dynamax:
-                        llm_move_id = llm_action_json["dynamax"].strip()
-                    elif tera:
-                        llm_move_id = llm_action_json["terastallize"].strip()
+                    # Extract move name from appropriate key
+                    if "dynamax" in llm_action_json and isinstance(llm_action_json["dynamax"], str):
+                        llm_move_id = llm_action_json["dynamax"].strip()  # Old format
+                    elif "terastallize" in llm_action_json and isinstance(llm_action_json["terastallize"], str):
+                        llm_move_id = llm_action_json["terastallize"].strip()  # Old format
                     else:
-                        llm_move_id = llm_action_json["move"].strip()
+                        llm_move_id = llm_action_json["move"].strip()  # Standard or new format
                     move_list = battle.available_moves
                     if dont_verify: # opponent
                         move_list = battle.opponent_active_pokemon.moves.values()
@@ -2207,69 +2378,33 @@ class LLMPlayer(Player):
         internal_start = time.time()
         
         root = optimizer.create_optimized_root(battle)
-        try:
+        
+        try:  # Ensure cleanup happens even on errors
             system_prompt, state_prompt, _, _, _, _, _ = root.simulation.get_player_prompt(return_actions=True)
             
-            # Ask LLM upfront whether to use minimax or damage calculator
+            # Deterministic gate for minimax vs damage calculator
             if not battle.active_pokemon.fainted and len(battle.available_moves) > 0:
                 # Get dmg calc move for potential early return
                 dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(battle)
                 if dmg_calc_out is not None:
-                    try:
-                        # Ask LLM to choose between damage calculator tool or minimax search upfront
-                        tool_prompt = '''Based on the current battle state, evaluate whether to use the damage calculator tool or the minimax tree search method. Consider the following factors:
-
-                        1. Damage calculator advantages:
-                        - Quick and efficient for finding optimal damaging moves
-                        - Useful when a clear type advantage or high-power move is available
-                        - Effective when the opponent is not switching and current pokemon is likely to KO opponent
-
-                        2. Minimax tree search advantages:
-                        - Can model opponent behavior and predict future moves
-                        - Useful in complex situations with multiple viable options
-                        - Effective when long-term strategy is crucial
-
-                        3. Current battle state:
-                        - Remaining Pokémon on each side
-                        - Health of active Pokémon
-                        - Type matchups
-                        - Available moves and their effects
-                        - Presence of status conditions or field effects
-
-                        4. Uncertainty level:
-                        - How predictable is the opponent's next move?
-                        - Are there multiple equally viable options for your next move?
-
-                        Evaluate these factors and decide which method would be more beneficial in the current situation. Output your choice in the following JSON format:
-
-                        {"choice":"damage calculator"} or {"choice":"minimax"}'''
-
-                        state_prompt_io = state_prompt + tool_prompt
-                        # Use action-tier settings for structured JSON selection
-                        llm_output = self.get_LLM_action(system_prompt=system_prompt,
-                                                        user_prompt=state_prompt_io,
-                                                        model=self.backend,
-                                                        temperature=self.temp_action,
-                                                        max_tokens=self.mt_action,
-                                                        json_format=True,
-                                                        )
-                        # Load when llm does heavylifting for parsing
-                        llm_action_json = json.loads(llm_output)
-                        if 'choice' in llm_action_json.keys():
-                            if llm_action_json['choice'] != 'minimax':
-                                # LLM chose damage calculator - return it directly
-                                print("LLM chose damage calculator over minimax")
-                                if return_opp:
-                                    try:
-                                        action_opp, _ = self.estimate_matchup(root.simulation, battle, 
-                                                                           battle.opponent_active_pokemon, 
-                                                                           battle.active_pokemon, is_opp=True)
-                                        return dmg_calc_out, self.create_order(action_opp) if action_opp else None
-                                    except:
-                                        return dmg_calc_out, None
-                                return dmg_calc_out
-                    except Exception as e:
-                        print(f'LLM choice failed ({e}), defaulting to minimax')
+                    # Use deterministic heuristic to decide
+                    if not self._should_use_minimax(battle, dmg_calc_turns):
+                        print(f'Using damage calculator (clear advantage in {dmg_calc_turns} turns)')
+                        progress_score = self._record_progress(battle)
+                        self._record_metric(battle, start_time, json_ok=True, fallback_reason='dmg_calc_deterministic', 
+                                          action_kind='move', action_label=str(getattr(dmg_calc_out, 'order', '')), 
+                                          max_tokens=0, tokens_prompt=0, tokens_completion=0, 
+                                          near_timeout=False, progress_score=progress_score)
+                        if return_opp:
+                            try:
+                                action_opp, _ = self.estimate_matchup(root.simulation, battle, 
+                                                                   battle.opponent_active_pokemon, 
+                                                                   battle.active_pokemon, is_opp=True)
+                                return dmg_calc_out, self.create_order(action_opp) if action_opp else None
+                            except:
+                                return dmg_calc_out, None
+                        return dmg_calc_out
+                    
             
             print("Using minimax tree search")
             
@@ -2322,28 +2457,79 @@ class LLMPlayer(Player):
                 
                 # Check if terminal node or reached depth limit
                 if node.simulation.is_terminal() or node.depth == self.K:
+                    # Check state-value cache first (post-step state)
+                    from pokechamp.minimax_optimizer import mk_ttkey, fast_battle_evaluation
+                    child_tt_key = mk_ttkey(node.simulation.battle)
+                    depth_remaining = self.K - node.depth
+                    cached_state_value = optimizer.get_state_value(child_tt_key, min_depth=depth_remaining)
+                    
+                    if cached_state_value is not None:
+                        # State-value cache hit! Skip evaluation entirely
+                        node.hp_diff = cached_state_value
+                        leaf_nodes.append(node)
+                        continue
+                    
+                    # Cache miss - need to evaluate
                     try:
-                        # Use LLM value function for leaf nodes evaluation
-                        value_prompt = 'Evaluate the score from 1-100 based on how likely the player is to win. Higher is better. Start at 50 points.' +\
-                                        'Add points based on the effectiveness of current available moves.' +\
-                                        'Award points for each pokemon remaining on the player\'s team, weighted by their strength' +\
-                                        'Add points for boosted status and opponent entry hazards and subtract points for status effects and player entry hazards. ' +\
-                                        'Subtract points for excessive switching.' +\
-                                        'Subtract points based on the effectiveness of the opponent\'s current moves, especially if they have a faster speed.' +\
-                                        'Remove points for each pokemon remaining on the opponent\'s team, weighted by their strength.\n'
-                        cot_prompt = 'Briefly justify your total score, up to 100 words. Then, conclude with the score in the JSON format: {"score": <total_points>}. '
-                        state_prompt_io = state_prompt + value_prompt + cot_prompt
-                        llm_output = self.get_LLM_action(system_prompt=system_prompt,
-                                                        user_prompt=state_prompt_io,
-                                                        model=self.backend,
-                                                        temperature=self.temp_expand,
-                                                        max_tokens=self.mt_expand,
-                                                        json_format=True,
-                                                        llm=self.llm_value
-                                                        )
-                        # Load when llm does heavylifting for parsing
-                        llm_action_json = json.loads(llm_output)
-                        node.hp_diff = int(llm_action_json['score'])
+                        # Use fast heuristic at interior nodes (depth < K)
+                        # Mix with LLM at deepest leaves (always, not just endgame)
+                        b = node.simulation.battle
+                        team_us = sum(not p.fainted for p in b.team.values())
+                        team_opp = sum(not p.fainted for p in b.opponent_team.values())
+                        is_endgame = (team_us <= 2 or team_opp <= 2)
+                        
+                        # Only use LLM at deepest leaves in critical situations
+                        # This actually reduces LLM calls for real speed improvement
+                        use_llm = (node.depth == self.K) and (
+                            is_endgame or  # Critical endgame positions
+                            abs(node.simulation.get_hp_diff()) < 20  # Close positions
+                        )
+                        
+                        if use_llm:
+                            # LLM critic for deepest leaves
+                            value_prompt = 'Evaluate the score from 1-100 based on how likely the player is to win. Higher is better. Start at 50 points.' +\
+                                            'Add points based on the effectiveness of current available moves.' +\
+                                            'Award points for each pokemon remaining on the player\'s team, weighted by their strength' +\
+                                            'Add points for boosted status and opponent entry hazards and subtract points for status effects and player entry hazards. ' +\
+                                            'Subtract points for excessive switching.' +\
+                                            'Subtract points based on the effectiveness of the opponent\'s current moves, especially if they have a faster speed.' +\
+                                            'Remove points for each pokemon remaining on the opponent\'s team, weighted by their strength.\n'
+                            cot_prompt = 'Briefly justify your total score, up to 100 words. Then, conclude with the score in the JSON format: {"score": <total_points>}. '
+                            state_prompt_io = state_prompt + value_prompt + cot_prompt
+                            llm_output = self.get_LLM_action(system_prompt=system_prompt,
+                                                            user_prompt=state_prompt_io,
+                                                            model=self.backend,
+                                                            temperature=self.temp_expand,
+                                                            max_tokens=self.mt_expand,
+                                                            json_format=True,
+                                                            llm=self.llm_value
+                                                            )
+                            # Load when llm does heavylifting for parsing
+                            llm_action_json = json.loads(llm_output)
+                            llm_score = int(llm_action_json['score'])
+                            
+                            # Get fast heuristic for mixing
+                            b = node.simulation.battle
+                            fast_score = fast_battle_evaluation(
+                                int((b.active_pokemon.current_hp_fraction or 0) * 5),
+                                int((b.opponent_active_pokemon.current_hp_fraction or 0) * 5),
+                                6 - sum(p.fainted for p in b.team.values()),
+                                6 - sum(p.fainted for p in b.opponent_team.values()),
+                                b.turn
+                            )
+                            
+                            # Use pure LLM score when we do call it (for critical positions)
+                            node.hp_diff = llm_score
+                        else:
+                            # Use fast heuristic only at interior nodes
+                            b = node.simulation.battle
+                            node.hp_diff = fast_battle_evaluation(
+                                int((b.active_pokemon.current_hp_fraction or 0) * 5),
+                                int((b.opponent_active_pokemon.current_hp_fraction or 0) * 5),
+                                6 - sum(p.fainted for p in b.team.values()),
+                                6 - sum(p.fainted for p in b.opponent_team.values()),
+                                b.turn
+                            )
                     except Exception as e:
                         # Fallback to damage calculator based evaluation
                         try:
@@ -2374,12 +2560,23 @@ class LLMPlayer(Player):
                             node.hp_diff = node.simulation.get_hp_diff()
                         print(f"LLM value function failed, using damage calculator fallback: {e}")
                     
-                    # Cache the evaluation result to avoid re-computing
-                    # Key: (parent_state, player_action, opp_action) → hp_diff
+                    # Cache the state value (post-step) for transposition table
+                    try:
+                        depth_remaining = self.K - node.depth
+                        optimizer.cache_state_value(child_tt_key, node.hp_diff, depth_remaining)
+                    except Exception:
+                        pass  # Cache failure shouldn't break search
+                    
+                    # Also cache by (parent, action, opp) for micro-memoization
                     try:
                         if node.parent_node and node.parent_node.simulation:
-                            parent_state_hash = create_battle_state_hash(node.parent_node.simulation.battle)
-                            optimizer.cache_evaluation(parent_state_hash, str(node.action), str(node.action_opp), node.hp_diff)
+                            from pokechamp.minimax_optimizer import canonical_action
+                            parent_tt_key = mk_ttkey(node.parent_node.simulation.battle)
+                            p_canonical = canonical_action(node.action, tera=getattr(node.simulation.battle, '_tera_intent', False))
+                            o_canonical = canonical_action(node.action_opp, tera=False)
+                            # Calculate remaining depth for caching
+                            depth_remaining = self.K - node.depth if hasattr(self, 'K') else 0
+                            optimizer.cache_evaluation(parent_tt_key, p_canonical, o_canonical, node.hp_diff, depth_remaining)
                     except Exception:
                         pass  # Cache failure shouldn't break search
                     
@@ -2443,12 +2640,15 @@ class LLMPlayer(Player):
                     for action_p in player_actions[:player_limit]:
                         for action_o in opponent_actions[:opponent_limit]:
                             try:
-                                # Check cache BEFORE stepping to avoid expensive simulation
-                                parent_state_hash = create_battle_state_hash(node.simulation.battle)
-                                cached_value = optimizer.get_cached_evaluation(parent_state_hash, str(action_p), str(action_o))
+                                # First try parent-action cache (micro-memorization)
+                                from pokechamp.minimax_optimizer import mk_ttkey, canonical_action
+                                parent_tt_key = mk_ttkey(node.simulation.battle)
+                                p_canonical = canonical_action(action_p, tera=getattr(node.simulation.battle, '_tera_intent', False))
+                                o_canonical = canonical_action(action_o, tera=False)
+                                cached_value = optimizer.get_cached_evaluation(parent_tt_key, p_canonical, o_canonical)
                                 
                                 if cached_value is not None:
-                                    # Cache hit! Skip simulation entirely and use cached value
+                                    # Parent-action cache hit!
                                     # Create a minimal child node without acquiring sim (no stepping needed)
                                     class CachedChildNode:
                                         """Lightweight node for cached evaluations (no sim needed)."""
@@ -2466,11 +2666,24 @@ class LLMPlayer(Player):
                                     node.children.append(child_node)
                                     # Don't increment nodes_created or add to queue - this is a cache hit
                                 else:
-                                    # Cache miss - need to simulate and evaluate
+                                    # Parent-action cache miss - create child and check state-value cache
                                     child_node = node.create_child_node(action_p, action_o)
                                     optimizer.stats['nodes_created'] += 1
-                                    q.append(child_node)
-                                    # Will be evaluated and cached later
+                                    
+                                    # Check state-value cache for the child state (post-step)
+                                    child_tt_key = mk_ttkey(child_node.simulation.battle)
+                                    child_min_depth = self.K - (node.depth + 1)  # depth remaining from child
+                                    state_value = optimizer.get_state_value(child_tt_key, min_depth=child_min_depth)
+                                    
+                                    if state_value is not None:
+                                        # State-value cache hit! Use cached value, don't add to queue
+                                        child_node.hp_diff = state_value
+                                        # Still add as child but mark as evaluated
+                                        node.children.append(child_node)
+                                    else:
+                                        # Full cache miss - need to evaluate later
+                                        q.append(child_node)
+                                        node.children.append(child_node)
                                     
                             except Exception as e:
                                 print(f"Failed to create child node: {e}")
@@ -2493,24 +2706,39 @@ class LLMPlayer(Player):
                         opp_dict[action] = child.action_opp
                     score_dict[action].append(child.hp_diff)
                 
-                # Use max score for each action
+                # Use MINIMAX (worst-case opponent reply) or robust mix
                 for action in score_dict:
-                    score_dict[action] = max(score_dict[action])
+                    if score_dict[action]:
+                        # Use robust value: mix worst-case with mean
+                        score_dict[action] = self._robust_value(score_dict[action], eta=0.25)
+                    else:
+                        score_dict[action] = float('-inf')
                 
                 best_action_str = max(score_dict, key=score_dict.get)
-                return action_dict[best_action_str], score_dict[best_action_str], opp_dict[best_action_str]
+                best_value = score_dict[best_action_str]
+                
+                # Cache the interior node value (after aggregating children)
+                if hasattr(root_node, 'simulation') and root_node.simulation:
+                    try:
+                        from pokechamp.minimax_optimizer import mk_ttkey
+                        interior_tt_key = mk_ttkey(root_node.simulation.battle)
+                        depth_remaining = self.K - root_node.depth
+                        optimizer.cache_state_value(interior_tt_key, best_value, depth_remaining)
+                    except Exception:
+                        pass  # Cache failure shouldn't break search
+                
+                return action_dict[best_action_str], best_value, opp_dict[best_action_str]
             
             action, _, action_opp = get_tree_action(root)
-            
-            # Cleanup resources
-            optimizer.cleanup_tree(root)
             
             # Log performance stats
             end_time = time.time()
             stats = optimizer.get_performance_stats()
+            cs = stats['cache_stats']
             print(f"⚡ Optimized minimax: {end_time - internal_start:.2f}s, "
                   f"Pool reuse: {stats['pool_stats']['reuse_rate']:.2f}, "
-                  f"Cache hit rate: {stats['cache_stats']['hit_rate']:.2f}")
+                  f"TT hits: {cs['state_value_hits']}/{cs['state_value_hits'] + cs['state_value_misses']}, "
+                  f"Q-cache: {cs['parent_action_hits']}/{cs['parent_action_hits'] + cs['parent_action_misses']}")
             
             # Record successful minimax completion
             progress_score = self._record_progress(battle)
@@ -2528,11 +2756,6 @@ class LLMPlayer(Player):
             
         except Exception as e:
             print(f"Optimized minimax failed: {e}, falling back to damage calculator")
-            # Cleanup any resources
-            try:
-                optimizer.cleanup_tree(root)
-            except:
-                pass
             # Fallback to damage calculator instead of original tree search
             try:
                 dmg_calc_move, _ = self.dmg_calc_move(battle)
@@ -2550,6 +2773,14 @@ class LLMPlayer(Player):
                 pass
             # Ultimate fallback to max damage move
             return self.choose_max_damage_move(battle)
+        
+        finally:
+            # Deterministic cleanup - always return sims to pool
+            # Don't rely on __del__ (brittle under cycles/GC)
+            try:
+                optimizer.cleanup_tree(root)
+            except:
+                pass  # Cleanup failure shouldn't crash
  
     def battle_summary(self):
 

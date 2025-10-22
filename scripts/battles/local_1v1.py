@@ -17,9 +17,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--player_prompt_algo", default="io", choices=prompt_algos)
 parser.add_argument("--player_backend", type=str, default="openai/gpt-4o", choices=[
     # OpenAI models (direct API)
-    "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
+    "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-mini", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
     # OpenAI models (via OpenRouter)
-    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
     # Anthropic models
     "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
@@ -38,9 +38,9 @@ parser.add_argument("--player_device", type=int, default=0)
 parser.add_argument("--opponent_prompt_algo", default="io", choices=prompt_algos)
 parser.add_argument("--opponent_backend", type=str, default="openai/gpt-4o", choices=[
     # OpenAI models (direct API)
-    "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
+    "gpt-5-pro", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3-mini", "gpt-4o", "gpt-4o-mini", "gpt-4o-2024-11-20", "gpt-4-turbo", "gpt-4",
     # OpenAI models (via OpenRouter)
-    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
+    "openai/gpt-5-pro", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano", "openai/o4-mini", "openai/o3-mini", "openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/gpt-4o-2024-11-20", "openai/gpt-4-turbo", "openai/gpt-4",
     # Anthropic models
     "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "anthropic/claude-opus-4.1", "anthropic/claude-3.5-sonnet",
     # Google models
@@ -56,9 +56,9 @@ parser.add_argument("--opponent_name", type=str, default='pokellmon', choices=bo
 parser.add_argument("--opponent_device", type=int, default=0)
 
 # Shared arguments
-parser.add_argument("--temperature", type=float, default=0.3)
+parser.add_argument("--temperature", type=float, default=0.3, help="Default temperature for both players")
 parser.add_argument("--reasoning_effort", type=str, default="low", choices=["low", "medium", "high"],
-                    help="Reasoning effort for o3-mini model (low=faster, high=better quality)")
+                    help="Reasoning effort for the supported models (low=faster, high=better quality)")
 parser.add_argument("--battle_format", default="gen9ou", choices=[
     # PokéAgent Challenge formats
     "gen1ou", "gen2ou", "gen3ou", "gen4ou", "gen9ou",
@@ -72,12 +72,22 @@ parser.add_argument("--battle_format", default="gen9ou", choices=[
 parser.add_argument("--log_dir", type=str, default="./battle_log/one_vs_one")
 parser.add_argument("--N", type=int, default=1)
 parser.add_argument("--verbose", action="store_true", help="Show detailed turn-by-turn battle information")
-parser.add_argument("--max_tokens", type=int, default=300, help="Max tokens for LLM replies (both players)")
+parser.add_argument("--max_tokens", type=int, default=300, help="Default max tokens for both players")
 parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
 parser.add_argument("--player_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (player)")
 parser.add_argument("--opponent_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (opponent)")
 parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
                     help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
+
+# Two-tier temperature/token configuration (shared, optional overrides)
+parser.add_argument("--temp_action", type=float, default=None,
+                    help="Temperature for structured JSON decisions (default: 0.0)")
+parser.add_argument("--mt_action", type=int, default=None,
+                    help="Max tokens for JSON decisions (default: 16)")
+parser.add_argument("--temp_expand", type=float, default=None,
+                    help="Temperature for reasoning/expansion (default: uses --temperature)")
+parser.add_argument("--mt_expand", type=int, default=None,
+                    help="Max tokens for expansion (default: uses --max_tokens)")
 
 args = parser.parse_args()
 
