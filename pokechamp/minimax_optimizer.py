@@ -360,7 +360,6 @@ class OptimizedSimNode:
         self.parent_action = None
         self.hp_diff = 0
         self.children: List['OptimizedSimNode'] = []
-        self.battle_state_hash = create_battle_state_hash(battle)
     
     def __del__(self):
         """Return simulation to pool when node is destroyed."""

@@ -268,14 +268,14 @@ class LLMPlayer(Player):
         # Calculate effective TTK accounting for speed
         our_effective_ttk = dmg_calc_turns + (0 if we_move_first else 1)
         
-        # Clear edge: we can KO in 1-2 turns and faster than opponent
-        clear_edge = (our_effective_ttk < their_best_ttk) and (dmg_calc_turns <= 2)
+        # Clear edge: we can KO in 1 turn AND we're faster by at least 1 full turn
+        clear_edge = (dmg_calc_turns <= 1) and (our_effective_ttk + 1 <= their_best_ttk)
         
         if clear_edge:
-            # Damage calc is good enough
+            # Damage calc is good enough - we have a decisive advantage
             return False
         else:
-            # Complex situation - use minimax
+            # Complex situation - use minimax for 2-3 turn races
             return True
     
     def legalize_choice(self, battle: Battle, choice: dict) -> Optional[BattleOrder]:
@@ -2088,6 +2088,172 @@ class LLMPlayer(Player):
         else:
             return None
     
+    def _deserialize_action(self, battle, act_dict, is_opp=False):
+        """
+        Convert action dict from propose_actions_topk to BattleOrder.
+        act_dict: {"action":"move|switch", "id":"<move_id|species>", "score":float}
+        """
+        try:
+            action_type = act_dict.get("action", "")
+            action_id = act_dict.get("id", "").lower().replace(" ", "").replace("-", "")
+            
+            if action_type == "move":
+                if is_opp:
+                    # For opponent, create order with move string
+                    # This is how estimate_matchup returns moves for opponents
+                    return self.create_order(action_id)
+                else:
+                    # Find matching move for player
+                    moves = battle.available_moves
+                    for move in moves:
+                        move_id = getattr(move, 'id', '').replace("-", "")
+                        if move_id == action_id:
+                            return self.create_order(move)
+            elif action_type == "switch":
+                if is_opp:
+                    # For opponent, create order with species string
+                    # This is how estimate_matchup returns switches for opponents
+                    return self.create_order(action_id)
+                else:
+                    # Find matching switch for player
+                    switches = battle.available_switches
+                    for mon in switches:
+                        species = getattr(mon, 'species', '').lower().replace(" ", "").replace("-", "")
+                        if species == action_id:
+                            return self.create_order(mon)
+            
+            if self.logger.level <= logging.DEBUG:
+                print(f"DEBUG: _deserialize_action returning None for {act_dict} (is_opp={is_opp})")
+            return None
+        except Exception as e:
+            if self.logger.level <= logging.DEBUG:
+                print(f"DEBUG: _deserialize_action exception: {e} for {act_dict} (is_opp={is_opp})")
+            return None
+    
+    def propose_actions_topk(self, battle, sim, k_player=3, k_opp=3, temperature=0.4, max_tokens=140):
+        """
+        Batched root proposal: Get top-K actions for both player and opponent in ONE call.
+        
+        Returns:
+          {
+            "player": [{"action":"move|switch","id":"<move_id|species>","score":float}, ...],
+            "opponent": [{"action":"move|switch","id":"<move_id|species>","score":float}, ...]
+          }
+        """
+        try:
+            system_prompt, state_prompt, acts_me, acts_opp, _, _, _ = sim.get_player_prompt(return_actions=True)
+            
+            prompt = f"""{state_prompt}
+
+TASK: Return top {k_player} actions for us (player) and top {k_opp} actions for opponent.
+
+For each action, provide:
+- action: "move" or "switch"
+- id: move name (e.g., "earthquake") or species (e.g., "gliscor")
+- score: 0.0-1.0 (win probability)
+
+Return JSON ONLY:
+{{"player": [{{"action":"move","id":"earthquake","score":0.75}}, ...], "opponent": [{{"action":"move","id":"icebeam","score":0.65}}, ...]}}
+
+Our legal actions: {', '.join(acts_me[:10])}
+Opponent likely actions: {', '.join(acts_opp[:10])}"""
+
+            llm_output = self.get_LLM_action(
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                model=self.backend,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_format=True
+            )
+            
+            result = self._extract_json_obj(llm_output)
+            if not result:
+                return {"player": [], "opponent": []}
+            
+            # Clamp to K
+            player_actions = result.get("player", [])[:k_player]
+            opp_actions = result.get("opponent", [])[:k_opp]
+            
+            return {"player": player_actions, "opponent": opp_actions}
+            
+        except Exception as e:
+            if self.logger.level <= logging.DEBUG:
+                print(f"Batched proposal failed: {e}")
+            return {"player": [], "opponent": []}
+    
+    def score_leaves_batch(self, leaves, temperature=0.0, max_tokens=180):
+        """
+        Batched leaf scoring: Score multiple leaf states in ONE call.
+        
+        Args:
+            leaves: List of nodes with .simulation.battle
+            
+        Returns:
+            List[float] - scores in [0,1] for each leaf
+        """
+        if not leaves:
+            return []
+        
+        try:
+            # Build compact state representation for each leaf
+            compact_leaves = []
+            for node in leaves:
+                b = node.simulation.battle
+                us = b.active_pokemon
+                opp = b.opponent_active_pokemon
+                
+                leaf_state = {
+                    "us": {
+                        "species": getattr(us, 'species', ''),
+                        "hp": int((getattr(us, 'current_hp_fraction', 0) or 0) * 100),
+                        "status": str(getattr(us, 'status', None)) if getattr(us, 'status', None) else None
+                    },
+                    "opp": {
+                        "species": getattr(opp, 'species', ''),
+                        "hp": int((getattr(opp, 'current_hp_fraction', 0) or 0) * 100),
+                        "status": str(getattr(opp, 'status', None)) if getattr(opp, 'status', None) else None
+                    },
+                    "endgame": len([p for p in b.team.values() if not p.fainted]) <= 2
+                }
+                compact_leaves.append(leaf_state)
+            
+            payload = {"leaves": compact_leaves}
+            
+            system_prompt = "You are a strong Gen9 OU evaluator that returns JSON only."
+            user_prompt = f"""For each leaf position, return a win probability for our side (0.0 = certain loss, 1.0 = certain win).
+
+Return JSON: {{"scores":[0.45, 0.78, ...]}}
+
+Positions to evaluate:
+{chr(10).join(f"{i}. Us:{leaf['us']['species']}@{leaf['us']['hp']}% vs Opp:{leaf['opp']['species']}@{leaf['opp']['hp']}%" for i, leaf in enumerate(compact_leaves))}"""
+
+            llm_output = self.get_LLM_action(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self.backend,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_format=True
+            )
+            
+            result = self._extract_json_obj(llm_output)
+            if not result or "scores" not in result:
+                return [0.5] * len(leaves)  # Neutral fallback
+            
+            scores = result.get("scores", [])
+            # Clamp to [0,1] and pad if needed
+            clamped = [float(max(0.0, min(1.0, s))) for s in scores]
+            while len(clamped) < len(leaves):
+                clamped.append(0.5)
+            
+            return clamped[:len(leaves)]
+            
+        except Exception as e:
+            if self.logger.level <= logging.DEBUG:
+                print(f"Batched leaf scoring failed: {e}")
+            return [0.5] * len(leaves)  # Neutral fallback
+    
     def rank_actions_batched(self, battle, sim=None, start_time=None):
         """
         Batched IO ranker: Get scored ranking for all legal actions in one LLM call.
@@ -2283,6 +2449,15 @@ Score each action and return the complete ranking array."""
                     node.hp_diff = node.simulation.get_hp_diff()                    
                     print(e)
                 
+                # Cache the child state value (CRITICAL for TT hits!)
+                try:
+                    from pokechamp.minimax_optimizer import mk_ttkey
+                    child_tt_key = mk_ttkey(node.simulation.battle)
+                    depth_remaining = self.K - node.depth
+                    optimizer.cache_state_value(child_tt_key, node.hp_diff, depth_remaining)
+                except Exception:
+                    pass
+                
                 leaf_nodes.append(node)
                 continue
             # panic_move = self.check_timeout(start_time, battle)
@@ -2442,11 +2617,18 @@ Score each action and return the complete ranking array."""
         # choose best action according to max or min rule
         def get_tree_action(root: SimNode):
             if len(root.children) == 0:
+                # This shouldn't happen for root node
+                if root.action is None:
+                    raise RuntimeError("Minimax search produced no valid actions")
                 return root.action, root.hp_diff, root.action_opp
             score_dict = {}
             action_dict = {}
             opp_dict = {}
             for child in root.children:
+                if child.action is None:
+                    if self.logger.level <= logging.DEBUG:
+                        print(f"DEBUG: Found None action in child node at depth {child.depth} (old minimax)")
+                    continue
                 action = str(child.action.order)
                 _, score, _ = get_tree_action(child)
                 if action in score_dict.keys():
@@ -2596,7 +2778,9 @@ Score each action and return the complete ranking array."""
                         
                         # Only use LLM at deepest leaves in critical situations
                         # This actually reduces LLM calls for real speed improvement
-                        use_llm = (node.depth == self.K) and (
+                        # Also check we have time for LLM call (need at least 2s for GPT-4o)
+                        time_for_llm = (time.time() + 2.0) < minimax_deadline
+                        use_llm = time_for_llm and (node.depth == self.K) and (
                             is_endgame or  # Critical endgame positions
                             abs(node.simulation.get_hp_diff()) < 20  # Close positions
                         )
@@ -2699,115 +2883,284 @@ Score each action and return the complete ranking array."""
                     leaf_nodes.append(node)
                     continue
                 
-                # Estimate opponent action (reuse existing logic)
-                try:
-                    action_opp, opp_turns = self.estimate_matchup(
-                        node.simulation, node.simulation.battle, 
-                        node.simulation.battle.opponent_active_pokemon, 
-                        node.simulation.battle.active_pokemon, 
-                        is_opp=True
-                    )
-                except:
-                    action_opp = None
-                    opp_turns = float('inf')
-                
-                # Get player actions - damage calculator move
-                if not node.simulation.battle.active_pokemon.fainted and len(battle.available_moves) > 0:
-                    # Get dmg calc move
-                    dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(node.simulation.battle)
-                    if dmg_calc_out is not None:
-                        player_actions.append(dmg_calc_out)
+                # Use batched proposal for root node, fallback to old method for deeper nodes
+                if node.depth == 0:
+                    # Batched proposal at root (ONE call for both player and opponent)
+                    try:
+                        seed = self.propose_actions_topk(node.simulation.battle, node.simulation, 
+                                                        k_player=3, k_opp=3,
+                                                        temperature=self.temp_expand, 
+                                                        max_tokens=140)
+                        # Deserialize player actions
+                        for act_dict in seed.get("player", []):
+                            action = self._deserialize_action(node.simulation.battle, act_dict, is_opp=False)
+                            if action and action not in player_actions:
+                                player_actions.append(action)
+                        
+                        # Deserialize opponent actions
+                        opponent_actions = []
+                        for act_dict in seed.get("opponent", []):
+                            action = self._deserialize_action(node.simulation.battle, act_dict, is_opp=True)
+                            if action and action not in opponent_actions:
+                                opponent_actions.append(action)
+                    except Exception as e:
+                        if self.logger.level <= logging.DEBUG:
+                            print(f"Batched proposal failed at root, using fallback: {e}")
+                    
+                    # If proposal failed or returned empty, enumerate all legal actions
+                    if not player_actions:
+                        # Add all legal moves
+                        for move in battle.available_moves:
+                            player_actions.append(self.create_order(move))
+                        # Add all legal switches
+                        for switch in battle.available_switches:
+                            player_actions.append(self.create_order(switch))
+                        
+                        # If still no actions, try damage calc
+                        if not player_actions and not node.simulation.battle.active_pokemon.fainted:
+                            dmg_calc_out, _ = self.dmg_calc_move(node.simulation.battle)
+                            if dmg_calc_out:
+                                player_actions.append(dmg_calc_out)
+                    
+                    # For opponent, use top-2 estimates
+                    if not opponent_actions:
+                        try:
+                            # Best damage move
+                            action_opp, _ = self.estimate_matchup(node.simulation, node.simulation.battle,
+                                                                 node.simulation.battle.opponent_active_pokemon,
+                                                                 node.simulation.battle.active_pokemon, is_opp=True)
+                            if action_opp:
+                                opponent_actions.append(self.create_order(action_opp))
+                            
+                            # Best switch (heuristic)
+                            best_score = np.inf
+                            best_switch = None
+                            for mon in node.simulation.battle.opponent_team.values():
+                                if mon.species != node.simulation.battle.opponent_active_pokemon.species and not mon.fainted:
+                                    score = self.calc_matchup_score(node.simulation.battle.active_pokemon, mon, gen=node.simulation.gen)
+                                    if score < best_score:
+                                        best_score = score
+                                        best_switch = mon
+                            if best_switch and len(opponent_actions) < 2:
+                                opponent_actions.append(self.create_order(best_switch))
+                        except:
+                            pass
+                else:
+                    # Non-root: use original logic (damage calc + estimate)
+                    try:
+                        action_opp, opp_turns = self.estimate_matchup(
+                            node.simulation, node.simulation.battle, 
+                            node.simulation.battle.opponent_active_pokemon, 
+                            node.simulation.battle.active_pokemon, 
+                            is_opp=True
+                        )
+                    except:
+                        action_opp = None
+                        opp_turns = float('inf')
+                    
+                    # Get player actions - damage calculator move
+                    if not node.simulation.battle.active_pokemon.fainted and len(battle.available_moves) > 0:
+                        dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(node.simulation.battle)
+                        if dmg_calc_out is not None:
+                            player_actions.append(dmg_calc_out)
 
-                # Generate opponent actions (reuse existing logic)
-                opponent_actions = []
-                if action_opp is not None:
-                    opponent_actions.append(self.create_order(action_opp))
-                
-                # Get more opponent actions via LLM (simplified)
-                try:
-                    system_prompt_o, state_prompt_o, constraint_prompt_cot_o, constraint_prompt_io_o, state_action_prompt_o = node.simulation.get_opponent_prompt(system_prompt)
-                    action_o = self.io(2, system_prompt_o, state_prompt_o, constraint_prompt_cot_o, constraint_prompt_io_o, state_action_prompt_o, node.simulation.battle, node.simulation, dont_verify=True)
-                    if action_o not in opponent_actions:
-                        opponent_actions.append(action_o)
-                except:
-                    pass  # Use what we have
-                
-                # Generate a few additional actions
-                try:
-                    action_io = self.io(2, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, node.simulation.battle, node.simulation, actions=player_actions)
-                    if action_io not in player_actions:
-                        player_actions.append(action_io)
-                except:
-                    pass
+                    # Generate opponent actions
+                    opponent_actions = []
+                    if action_opp is not None:
+                        opponent_actions.append(self.create_order(action_opp))
                 
                 # Create child nodes efficiently (if not at depth limit)
-                if node.depth < self.K and player_actions and opponent_actions:
-                    # Further limit branching if we're running low on time
-                    time_remaining = minimax_deadline - time.time()
-                    if time_remaining < 2.0:  # Less than 2 seconds left
-                        # Only explore 1 action each when low on time
-                        player_limit = 1
-                        opponent_limit = 1
-                    else:
-                        # Normal limits
-                        player_limit = 2
-                        opponent_limit = 2
+                if node.depth < self.K:
+                    if not player_actions or not opponent_actions:
+                        if self.logger.level <= logging.DEBUG:
+                            print(f"DEBUG: No actions to expand at depth {node.depth} - player_actions: {len(player_actions) if player_actions else 0}, opponent_actions: {len(opponent_actions) if opponent_actions else 0}")
                     
-                    for action_p in player_actions[:player_limit]:
-                        for action_o in opponent_actions[:opponent_limit]:
-                            try:
-                                # First try parent-action cache (micro-memorization)
-                                from pokechamp.minimax_optimizer import mk_ttkey, canonical_action
-                                parent_tt_key = mk_ttkey(node.simulation.battle)
-                                p_canonical = canonical_action(action_p, tera=getattr(node.simulation.battle, '_tera_intent', False))
-                                o_canonical = canonical_action(action_o, tera=False)
-                                cached_value = optimizer.get_cached_evaluation(parent_tt_key, p_canonical, o_canonical)
-                                
-                                if cached_value is not None:
-                                    # Parent-action cache hit!
-                                    # Create a minimal child node without acquiring sim (no stepping needed)
-                                    class CachedChildNode:
-                                        """Lightweight node for cached evaluations (no sim needed)."""
-                                        def __init__(self, action, action_opp, hp_diff, parent):
-                                            self.action = action
-                                            self.action_opp = action_opp
-                                            self.hp_diff = hp_diff
-                                            self.parent_node = parent
-                                            self.parent_action = parent.action
-                                            self.children = []
-                                            self.depth = parent.depth + 1
-                                            self.simulation = None  # No sim needed for cached nodes
-                                    
-                                    child_node = CachedChildNode(action_p, action_o, cached_value, node)
-                                    node.children.append(child_node)
-                                    # Don't increment nodes_created or add to queue - this is a cache hit
-                                else:
-                                    # Parent-action cache miss - create child and check state-value cache
-                                    child_node = node.create_child_node(action_p, action_o)
-                                    optimizer.stats['nodes_created'] += 1
-                                    
-                                    # Check state-value cache for the child state (post-step)
-                                    child_tt_key = mk_ttkey(child_node.simulation.battle)
+                    if player_actions and opponent_actions:
+                        # Further limit branching if we're running low on time
+                        time_remaining = minimax_deadline - time.time()
+                        if time_remaining < 2.0:  # Less than 2 seconds left
+                            # Only explore 1 action each when low on time
+                            player_limit = 1
+                            opponent_limit = 1
+                        else:
+                            # Normal limits
+                            player_limit = 2
+                            opponent_limit = 2
+                        
+                        for action_p in player_actions[:player_limit]:
+                            for action_o in opponent_actions[:opponent_limit]:
+                                try:
+                                    # First try parent-action cache (micro-memorization)
+                                    from pokechamp.minimax_optimizer import mk_ttkey, canonical_action
+                                    parent_tt_key = mk_ttkey(node.simulation.battle)
+                                    p_canonical = canonical_action(action_p, tera=getattr(node.simulation.battle, '_tera_intent', False))
+                                    o_canonical = canonical_action(action_o, tera=False)
                                     child_min_depth = self.K - (node.depth + 1)  # depth remaining from child
-                                    state_value = optimizer.get_state_value(child_tt_key, min_depth=child_min_depth)
+                                    cached_value = optimizer.get_cached_evaluation(parent_tt_key, p_canonical, o_canonical, min_depth=child_min_depth)
                                     
-                                    if state_value is not None:
-                                        # State-value cache hit! Use cached value, don't add to queue
-                                        child_node.hp_diff = state_value
-                                        # Still add as child but mark as evaluated
+                                    if cached_value is not None:
+                                        # Parent-action cache hit!
+                                        # Create a minimal child node without acquiring sim (no stepping needed)
+                                        class CachedChildNode:
+                                            """Lightweight node for cached evaluations (no sim needed)."""
+                                            def __init__(self, action, action_opp, hp_diff, parent):
+                                                self.action = action
+                                                self.action_opp = action_opp
+                                                self.hp_diff = hp_diff
+                                                self.parent_node = parent
+                                                self.parent_action = parent.action
+                                                self.children = []
+                                                self.depth = parent.depth + 1
+                                                self.simulation = None  # No sim needed for cached nodes
+                                        
+                                        child_node = CachedChildNode(action_p, action_o, cached_value, node)
                                         node.children.append(child_node)
+                                        # Don't increment nodes_created or add to queue - this is a cache hit
                                     else:
-                                        # Full cache miss - need to evaluate later
-                                        q.append(child_node)
-                                        node.children.append(child_node)
-                                    
-                            except Exception as e:
-                                print(f"Failed to create child node: {e}")
-                                continue
+                                        # Parent-action cache miss - create child and check state-value cache
+                                        child_node = node.create_child_node(action_p, action_o)
+                                        optimizer.stats['nodes_created'] += 1
+                                        
+                                        # Check state-value cache for the child state (post-step)
+                                        child_tt_key = mk_ttkey(child_node.simulation.battle)
+                                        child_min_depth = self.K - (node.depth + 1)  # depth remaining from child
+                                        state_value = optimizer.get_state_value(child_tt_key, min_depth=child_min_depth)
+                                        
+                                        if state_value is not None:
+                                            # State-value cache hit! Use cached value, don't add to queue
+                                            child_node.hp_diff = state_value
+                                            # Still add as child but mark as evaluated
+                                            node.children.append(child_node)
+                                        else:
+                                            # Full cache miss - need to evaluate later
+                                            q.append(child_node)
+                                            node.children.append(child_node)
+                                        
+                                except Exception as e:
+                                    print(f"Failed to create child node: {e}")
+                                    continue
+            
+            # Batch evaluate any unevaluated leaf nodes (only if we have time)
+            time_remaining = minimax_deadline - time.time()
+            unevaluated_leaves = [n for n in leaf_nodes if n.hp_diff is None or n.hp_diff == 0]
+            
+            # Only do batch evaluation if we have at least 2 seconds left (typical GPT-4o latency)
+            if unevaluated_leaves and time_remaining > 2.0:
+                try:
+                    # Prepare batch for scoring
+                    batch_states = []
+                    for node in unevaluated_leaves:
+                        try:
+                            # Create a compact representation of the leaf state
+                            b = node.simulation.battle
+                            state_dict = {
+                                "hp_us": int((b.active_pokemon.current_hp_fraction or 0) * 100),
+                                "hp_opp": int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100),
+                                "team_us": sum(not p.fainted for p in b.team.values()),
+                                "team_opp": sum(not p.fainted for p in b.opponent_team.values()),
+                                "turn": b.turn,
+                                "species_us": b.active_pokemon.species,
+                                "species_opp": b.opponent_active_pokemon.species
+                            }
+                            batch_states.append(state_dict)
+                        except Exception:
+                            batch_states.append(None)
+                    
+                    # Score all leaves in one LLM call
+                    scores = self.score_leaves_batch(batch_states, temperature=self.temp_expand or 0.0, max_tokens=min(180, self.mt_expand or 180))
+                    
+                    # Apply scores and cache
+                    for node, score in zip(unevaluated_leaves, scores):
+                        if score is not None:
+                            node.hp_diff = float(score)
+                            # Cache both TT and parent-edge
+                            from pokechamp.minimax_optimizer import mk_ttkey, canonical_action
+                            depth_remaining = self.K - node.depth
+                            child_tt_key = mk_ttkey(node.simulation.battle)
+                            optimizer.cache_state_value(child_tt_key, node.hp_diff, depth_remaining)
+                            
+                            if node.parent_node and hasattr(node, 'action') and hasattr(node, 'action_opp'):
+                                parent_tt_key = mk_ttkey(node.parent_node.simulation.battle)
+                                p_canonical = canonical_action(node.action, tera=getattr(node.simulation.battle, '_tera_intent', False))
+                                o_canonical = canonical_action(node.action_opp, tera=False)
+                                optimizer.cache_evaluation(parent_tt_key, p_canonical, o_canonical, node.hp_diff, depth_remaining)
+                        elif node.hp_diff is None or node.hp_diff == 0:
+                            # Fallback to heuristic if batch scoring failed
+                            from pokechamp.minimax_optimizer import fast_battle_evaluation
+                            b = node.simulation.battle
+                            hp_p = int((b.active_pokemon.current_hp_fraction or 0) * 100)
+                            hp_o = int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100)
+                            team_p = sum(not p.fainted for p in b.team.values())
+                            team_o = sum(not p.fainted for p in b.opponent_team.values())
+                            node.hp_diff = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+                except Exception as e:
+                    if self.logger.level <= logging.DEBUG:
+                        print(f"DEBUG: Batch leaf evaluation failed: {e}")
+
+                    # Ensure all leaves have some value
+                    for node in unevaluated_leaves:
+                        if node.hp_diff is None or node.hp_diff == 0:
+                            from pokechamp.minimax_optimizer import fast_battle_evaluation
+                            b = node.simulation.battle
+                            hp_p = int((b.active_pokemon.current_hp_fraction or 0) * 100)
+                            hp_o = int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100)
+                            team_p = sum(not p.fainted for p in b.team.values())
+                            team_o = sum(not p.fainted for p in b.opponent_team.values())
+                            node.hp_diff = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+            else:
+                # Skipped batch eval due to time - ensure all leaves have heuristic values
+                if unevaluated_leaves:
+                    if self.logger.level <= logging.DEBUG:
+                        print(f"DEBUG: Skipping batch eval ({len(unevaluated_leaves)} leaves) - only {time_remaining:.1f}s left")
+                    from pokechamp.minimax_optimizer import fast_battle_evaluation
+
+                    for node in unevaluated_leaves:
+                        if node.hp_diff is None or node.hp_diff == 0:
+                            b = node.simulation.battle
+                            hp_p = int((b.active_pokemon.current_hp_fraction or 0) * 100)
+                            hp_o = int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100)
+                            team_p = sum(not p.fainted for p in b.team.values())
+                            team_o = sum(not p.fainted for p in b.opponent_team.values())
+                            node.hp_diff = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+            
+            # Guard against empty root
+            if not root.children:
+                # Force-enumerate legal actions if pruning/estimates returned nothing
+                legal_moves = battle.available_moves or []
+                legal_switches = battle.available_switches or []
+                
+                if self.logger.level <= logging.DEBUG:
+                    print(f"DEBUG: Root has no children, forcing enumeration of {len(legal_moves)} moves and {len(legal_switches)} switches")
+                
+                for mv in legal_moves:
+                    try:
+                        child_node = root.create_child_node(self.create_order(mv), None)
+                        optimizer.stats['nodes_created'] += 1
+                        root.children.append(child_node)
+                    except Exception as e:
+                        if self.logger.level <= logging.DEBUG:
+                            print(f"DEBUG: Failed to create child for move {mv}: {e}")
+                
+                for sw in legal_switches:
+                    try:
+                        child_node = root.create_child_node(self.create_order(sw), None)
+                        optimizer.stats['nodes_created'] += 1
+                        root.children.append(child_node)
+                    except Exception as e:
+                        if self.logger.level <= logging.DEBUG:
+                            print(f"DEBUG: Failed to create child for switch {sw}: {e}")
+                
+                if not root.children:
+                    # Absolute last resort: max damage move
+                    print("WARNING: No valid actions could be created, falling back to max damage")
+                    return self.choose_max_damage_move(battle)
             
             # Choose best action using original logic
             def get_tree_action(root_node):
                 if len(root_node.children) == 0:
+                    # Root node has no action, this shouldn't happen unless search failed
+                    if root_node.action is None:
+                        raise RuntimeError("Minimax search produced no valid actions")
                     return root_node.action, root_node.hp_diff, root_node.action_opp
                     
                 score_dict = {}
@@ -2815,6 +3168,10 @@ Score each action and return the complete ranking array."""
                 opp_dict = {}
                 
                 for child in root_node.children:
+                    if child.action is None:
+                        if self.logger.level <= logging.DEBUG:
+                            print(f"DEBUG: Found None action in child node at depth {child.depth}")
+                        continue
                     action = str(child.action.order)
                     if action not in score_dict:
                         score_dict[action] = []

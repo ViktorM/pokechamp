@@ -108,9 +108,7 @@ class GPTPlayer():
                     }
                 if supports_reasoning and reasoning_effort is not None:
                     request_params["reasoning"] = {"effort": reasoning_effort}
-                if not self._compat_logged:
-                    print(f"[OpenAI GPT] api=responses model={model} tokens_param=max_output_tokens stop_sent=False json_schema={bool(json_format)}")
-                    self._compat_logged = True
+
                 try:
                     r = client.responses.create(**request_params)
                 except TypeError as te:
@@ -161,10 +159,7 @@ class GPTPlayer():
                     request_params["response_format"] = {"type": "json_object"}
                 if self.service_tier:
                     request_params["service_tier"] = self.service_tier
-                if not self._compat_logged:
-                    token_param = "max_completion_tokens" if uses_max_completion_tokens else ("max_output_tokens" if uses_max_output_tokens else "max_tokens")
-                    print(f"[OpenAI GPT] api=chat model={model} tokens_param={token_param} stop_sent={bool(supports_stop and stop)} json_mode={bool(json_format)}")
-                    self._compat_logged = True
+                # Compatibility logging removed (too noisy)
                 response = client.chat.completions.create(**request_params)
         except RateLimitError:
             # sleep 5 seconds and try again
@@ -244,9 +239,7 @@ class GPTPlayer():
                         },
                         "strict": True
                     }
-                if not self._compat_logged:
-                    print(f"[OpenAI GPT] api=responses model={model} tokens_param=max_output_tokens stop_sent=False json_schema={bool(json_format)}")
-                    self._compat_logged = True
+                # Compatibility logging removed (too noisy)
                 try:
                     r = client.responses.create(**params)
                 except TypeError as te:
@@ -288,10 +281,7 @@ class GPTPlayer():
                     params["response_format"] = {"type": "json_object"}
                 if self.service_tier:
                     params["service_tier"] = self.service_tier
-                if not self._compat_logged:
-                    token_param = "max_completion_tokens" if uses_max_completion_tokens else ("max_output_tokens" if uses_max_output_tokens else "max_tokens")
-                    print(f"[OpenAI GPT] api=chat model={model} tokens_param={token_param} stop_sent={bool(supports_stop and stop)} json_mode={bool(json_format)}")
-                    self._compat_logged = True
+                # Compatibility logging removed (too noisy)
                 response = client.chat.completions.create(**params)
                 message = response.choices[0].message.content
 
