@@ -616,11 +616,31 @@ class LLMPlayer(Player):
         # Single-call rank-and-pick
         elif self.prompt_algo == "rank":
             return self.rank_and_pick(retries, system_prompt, state_prompt, state_action_prompt, battle, sim, actions=actions)
-        
+
+        # Batched IO ranker (scores all actions in one call)
+        elif self.prompt_algo == "ranker":
+            start_time = time.time()
+            ranked_actions = self.rank_actions_batched(battle, sim=sim, start_time=start_time)
+
+            if ranked_actions:
+                # Return top-1 action
+                best_action, best_score = ranked_actions[0]
+                # Only print in debug mode (if logger level is DEBUG)
+                if self.logger.level <= logging.DEBUG:
+                    print(f"[Ranker] Selected {best_action} with score {best_score:.1f}")
+                return best_action
+            else:
+                # Fallback to damage calculator
+                if self.logger.level <= logging.DEBUG:
+                    print("[Ranker] Failed, using damage calculator")
+                move, _ = self.dmg_calc_move(battle)
+                return move
+
         # Tree of thought, k = 3
         elif self.prompt_algo == "tot":
             llm_output1 = ""
             next_action = None
+
             for i in range(retries):
                 try:
                     llm_output1 = self.get_LLM_action(system_prompt=system_prompt,
@@ -699,7 +719,6 @@ class LLMPlayer(Player):
                 progress_score=progress_score,
             )
             return action
-
         
     def _init_metrics_file(self):
         if not self.log_dir:
@@ -1006,7 +1025,7 @@ class LLMPlayer(Player):
                                         tokens_prompt=d_prompt, tokens_completion=d_comp, near_timeout=near_timeout, progress_score=progress_score)
                     break
             except Exception as e:
-                print(f'Exception (JSON/selection): {e}', 'passed')
+                print(f'Exception (JSON/selection) [{self.backend}]: {e}', 'passed')
                 # Try forgiving recovery from free-form text
                 try:
                     recovered = self._recover_action_from_text(llm_output if 'llm_output' in locals() else '', battle)
@@ -2069,7 +2088,101 @@ class LLMPlayer(Player):
         else:
             return None
     
-    def tree_search(self, retries, battle, sim=None, return_opp = False, start_time=None) -> BattleOrder:
+    def rank_actions_batched(self, battle, sim=None, start_time=None):
+        """
+        Batched IO ranker: Get scored ranking for all legal actions in one LLM call.
+        Returns: List[(action, score)] sorted by score descending
+        """
+        if start_time is None:
+            start_time = time.time()
+        
+        # Get or create sim
+        if sim is None:
+            from poke_env.player.local_simulation import LocalSimulation
+            sim = LocalSimulation(battle, self.pokemon_move_dict, self.move_effect, self.ability_effect, 
+                                 self.item_effect, self.type_chart, self.type_list)
+        
+        try:
+            # Collect all legal actions
+            legal_actions = []
+            action_map = {}  # index -> BattleOrder
+            
+            # Add moves
+            for idx, move in enumerate(battle.available_moves):
+                move_name = getattr(move, 'id', str(move))
+                legal_actions.append(f"move:{move_name}")
+                action_map[len(action_map)] = self.create_order(move)
+            
+            # Add switches
+            for mon in battle.available_switches:
+                species = getattr(mon, 'species', str(mon)).lower()
+                legal_actions.append(f"switch:{species}")
+                action_map[len(action_map)] = self.create_order(mon)
+            
+            if not legal_actions:
+                return []
+            
+            # Build prompt
+            from pokechamp.prompts import state_translate2
+            state_desc = state_translate2(sim, battle)
+            
+            ranking_prompt = f"""{state_desc}
+
+TASK: Score ALL legal actions below on a 0-100 scale, where:
+- 0 = certain loss
+- 50 = neutral/unclear
+- 100 = likely win
+
+Assume opponent plays optimally. Return a JSON object with this exact format:
+{{"ranking": [{{"action": "move:moonblast", "score": 75}}, {{"action": "switch:gliscor", "score": 45}}, ...]}}
+
+Legal actions to score:
+{chr(10).join(f"{i}. {act}" for i, act in enumerate(legal_actions))}
+
+Score each action and return the complete ranking array."""
+
+            # Make single LLM call
+            llm_output = self.get_LLM_action(
+                system_prompt="You are an expert Pokemon battler. Provide strategic evaluations.",
+                user_prompt=ranking_prompt,
+                model=self.backend,
+                temperature=self.temp_expand,  # Use expand tier for evaluation
+                max_tokens=min(self.mt_expand, 400),  # Cap at 400 for ranking
+                json_format=True,
+                reasoning_effort=self.reasoning_effort
+            )
+            
+            # Parse JSON
+            llm_json = self._extract_json_obj(llm_output)
+            if not llm_json or "ranking" not in llm_json:
+                raise ValueError("No ranking in LLM output")
+            
+            # Extract scores
+            ranked_results = []
+            ranking_list = llm_json["ranking"]
+            
+            for entry in ranking_list:
+                action_str = entry.get("action", "")
+                score = entry.get("score", 0)
+                
+                # Map action string back to BattleOrder
+                if action_str in legal_actions:
+                    idx = legal_actions.index(action_str)
+                    battle_order = action_map.get(idx)
+                    if battle_order:
+                        ranked_results.append((battle_order, float(score)))
+
+            # Sort by score descending
+            ranked_results.sort(key=lambda x: x[1], reverse=True)
+            
+            return ranked_results
+            
+        except Exception as e:
+            print(f"Batched ranker failed: {e}")
+            # Fallback: return empty list (caller should handle)
+            return []
+    
+    def tree_search(self, retries, battle, sim=None, return_opp=False, start_time=None) -> BattleOrder:
         # generate local simulation
         root = SimNode(battle, 
                         self.move_effect,
@@ -2093,10 +2206,10 @@ class LLMPlayer(Player):
         if start_time is None:
             start_time = time.time()
         internal_start = time.time()
-        
+
         # Set a hard deadline for minimax - leave 1s for final processing
         minimax_deadline = start_time + self.move_time_limit_s - 1.0
-        
+
         while len(q) != 0:
             # Check timeout before processing next node
             if time.time() > minimax_deadline:
@@ -2105,6 +2218,7 @@ class LLMPlayer(Player):
                 if leaf_nodes:
                     # Use whatever we have explored so far
                     break
+
                 # Otherwise, fall back to damage calculator
                 dmg_calc_out, _ = self.dmg_calc_move(battle)
                 if dmg_calc_out is not None:
@@ -2123,6 +2237,7 @@ class LLMPlayer(Player):
                         except:
                             return dmg_calc_out, None
                     return dmg_calc_out
+
                 # Last resort: max damage move
                 progress_score = self._record_progress(battle)
                 self._record_timeout(battle, avoided=False)
@@ -2131,6 +2246,7 @@ class LLMPlayer(Player):
                                     tokens_prompt=0, tokens_completion=0, near_timeout=True, 
                                     progress_score=progress_score)
                 return self.choose_max_damage_move(battle)
+
             node = q.pop(0)
             # choose node for expansion
             # generate B actions

@@ -14,7 +14,8 @@ prompt_algos = [
     'max_power',
     'one_step',
     'random',
-    'rank'  # New single-call rank-and-pick algorithm
+    'rank',   # Single-call rank-and-pick with belief mixing
+    'ranker'  # Batched IO: scores all actions in one call
     ]
 
 def get_available_bots():
