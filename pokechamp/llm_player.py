@@ -2806,8 +2806,10 @@ Score each action and return the complete ranking array."""
 
                 node = q.pop(0)
 
-                # Get available actions efficiently 
+                # Unify battle reference and initialize action lists once per node
+                b = node.simulation.battle
                 player_actions = []
+                opponent_actions = []
                 system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, action_prompt_switch, action_prompt_move = node.simulation.get_player_prompt(return_actions=True)
 
                 # Check if terminal node or reached depth limit
@@ -2943,7 +2945,7 @@ Score each action and return the complete ranking array."""
                             # Ultimate fallback to basic hp difference
                             node.hp_diff = node.simulation.get_hp_diff()
                         print(f"LLM value function failed, using damage calculator fallback: {e}")
-                    
+
                     # Cache the state value (post-step) for transposition table
                     try:
                         depth_remaining = max(0, self.K - node.depth)
@@ -2999,43 +3001,42 @@ Score each action and return the complete ranking array."""
 
                     # If proposal failed or returned empty, enumerate all legal actions
                     if not player_actions:
-                        b_root = node.simulation.battle  # Use simulated state, not root battle
                         # Add all legal moves
-                        for move in b_root.available_moves:
+                        for move in b.available_moves:
                             player_actions.append(self.create_order(move))
                         # Add all legal switches
-                        for switch in b_root.available_switches:
+                        for switch in b.available_switches:
                             player_actions.append(self.create_order(switch))
 
                         # If still no actions, try damage calc
-                        if not player_actions and not b_root.active_pokemon.fainted:
-                            dmg_calc_out, _ = self.dmg_calc_move(b_root)
+                        if not player_actions and not b.active_pokemon.fainted:
+                            dmg_calc_out, _ = self.dmg_calc_move(b)
                             if dmg_calc_out:
                                 player_actions.append(dmg_calc_out)
 
                         # Absolute fallback: pick the first legal action
                         if not player_actions:
-                            if b_root.available_moves:
-                                player_actions.append(self.create_order(b_root.available_moves[0]))
-                            elif b_root.available_switches:
-                                player_actions.append(self.create_order(b_root.available_switches[0]))
+                            if b.available_moves:
+                                player_actions.append(self.create_order(b.available_moves[0]))
+                            elif b.available_switches:
+                                player_actions.append(self.create_order(b.available_switches[0]))
 
                     # For opponent, use top-2 estimates
                     if not opponent_actions:
                         try:
                             # Best damage move
-                            action_opp, _ = self.estimate_matchup(node.simulation, node.simulation.battle,
-                                                                 node.simulation.battle.opponent_active_pokemon,
-                                                                 node.simulation.battle.active_pokemon, is_opp=True)
+                            action_opp, _ = self.estimate_matchup(node.simulation, b,
+                                                                 b.opponent_active_pokemon,
+                                                                 b.active_pokemon, is_opp=True)
                             if action_opp:
                                 opponent_actions.append(self.create_order(action_opp))
 
                             # Best switch (heuristic)
                             best_score = np.inf
                             best_switch = None
-                            for mon in node.simulation.battle.opponent_team.values():
-                                if mon.species != node.simulation.battle.opponent_active_pokemon.species and not mon.fainted:
-                                    score = self._estimate_matchup(mon, node.simulation.battleactive_pokemon)
+                            for mon in b.opponent_team.values():
+                                if mon.species != b.opponent_active_pokemon.species and not mon.fainted:
+                                    score = self._estimate_matchup(mon, b.active_pokemon)
                                     if score < best_score:
                                         best_score = score
                                         best_switch = mon
@@ -3047,9 +3048,9 @@ Score each action and return the complete ranking array."""
                     # Non-root: use original logic (damage calc + estimate)
                     try:
                         action_opp, opp_turns = self.estimate_matchup(
-                            node.simulation, node.simulation.battle, 
-                            node.simulation.battle.opponent_active_pokemon, 
-                            node.simulation.battle.active_pokemon, 
+                            node.simulation, b, 
+                            b.opponent_active_pokemon, 
+                            b.active_pokemon, 
                             is_opp=True
                         )
                     except:
@@ -3057,21 +3058,19 @@ Score each action and return the complete ranking array."""
                         opp_turns = float('inf')
 
                     # For inner nodes (depth > 0), use heuristic action generation
-                    b_sim = node.simulation.battle
-
                     # Add top damage move
-                    if not b_sim.active_pokemon.fainted and b_sim.available_moves:
-                        dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(b_sim)
+                    if not b.active_pokemon.fainted and b.available_moves:
+                        dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(b)
                         if dmg_calc_out is not None:
                             player_actions.append(dmg_calc_out)
 
                     # Add best switch if available
-                    if b_sim.available_switches:
+                    if b.available_switches:
                         best_switch_score = -np.inf
                         best_switch = None
-                        for switch_mon in b_sim.available_switches:
+                        for switch_mon in b.available_switches:
                             # Estimate matchup score
-                            score = -self._estimate_matchup(switch_mon, b_sim.opponent_active_pokemon)
+                            score = -self._estimate_matchup(switch_mon, b.opponent_active_pokemon)
                             if score > best_switch_score:
                                 best_switch_score = score
                                 best_switch = switch_mon
@@ -3081,13 +3080,13 @@ Score each action and return the complete ranking array."""
 
                     # Safety net 1: If still empty, enumerate all legal moves
                     if not player_actions:
-                        for mv in (b_sim.available_moves or []):
+                        for mv in (b.available_moves or []):
                             player_actions.append(self.create_order(mv))
 
                     # Safety net 2: If still empty, add 1-2 best switches
-                    if not player_actions and b_sim.available_switches:
-                        switches = sorted(b_sim.available_switches,
-                                        key=lambda s: -self._estimate_matchup(s, b_sim.opponent_active_pokemon))[:2]
+                    if not player_actions and b.available_switches:
+                        switches = sorted(b.available_switches,
+                                        key=lambda s: -self._estimate_matchup(s, b.opponent_active_pokemon))[:2]
                         for sw in switches:
                             player_actions.append(self.create_order(sw))
 
@@ -3098,39 +3097,38 @@ Score each action and return the complete ranking array."""
                         if self.logger.level <= logging.DEBUG:
                             print(f"WARNING: No legal actions for inner node at depth {node.depth}")
 
-                # Generate opponent actions (always ensure ≥2: damage + pivot)
-                opponent_actions = []
-                if action_opp is not None:
-                    opponent_actions.append(self.create_order(action_opp))
+                    # Generate opponent actions (always ensure ≥2: damage + pivot)
+                    if action_opp is not None:
+                        opponent_actions.append(self.create_order(action_opp))
 
                     # Add best defensive pivot/switch
                     if len(opponent_actions) < 2:
                         best_score = np.inf
                         best_switch = None
-                        for mon in b_sim.opponent_team.values():
-                            if mon != b_sim.opponent_active_pokemon and not mon.fainted:
-                                score = self._estimate_matchup(mon, b_sim.active_pokemon)
+                        for mon in b.opponent_team.values():
+                            if mon != b.opponent_active_pokemon and not mon.fainted:
+                                score = self._estimate_matchup(mon, b.active_pokemon)
                                 if score < best_score:
                                     best_score = score
                                     best_switch = mon
                         if best_switch:
                             opponent_actions.append(self.create_order(best_switch))
-                    
+
                     # Safety net: If still < 2, add any available opponent moves/switches
-                    if len(opponent_actions) < 2 and b_sim.opponent_active_pokemon:
+                    if len(opponent_actions) < 2 and b.opponent_active_pokemon:
                         # Try opponent's best damage move
                         if len(opponent_actions) < 2:
-                            for mv in (getattr(b_sim.opponent_active_pokemon, 'moves', {}).values() or []):
+                            for mv in (getattr(b.opponent_active_pokemon, 'moves', {}).values() or []):
                                 if len(opponent_actions) >= 2:
                                     break
                                 opponent_actions.append(self.create_order(mv))
 
                         # If still < 2, add any healthy opponent pokemon
                         if len(opponent_actions) < 2:
-                            for mon in b_sim.opponent_team.values():
+                            for mon in b.opponent_team.values():
                                 if len(opponent_actions) >= 2:
                                     break
-                                if not mon.fainted and mon != b_sim.opponent_active_pokemon:
+                                if not mon.fainted and mon != b.opponent_active_pokemon:
                                     opponent_actions.append(self.create_order(mon))
                 
                 # Create child nodes efficiently (if not at depth limit)
