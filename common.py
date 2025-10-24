@@ -6,6 +6,7 @@ import inspect
 
 prompt_algos = [
     "io", 
+    "io2",    # Improved IO with numbered contract and early gate
     "sc", 
     "cot", 
     "tot", 

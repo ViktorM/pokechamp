@@ -33,7 +33,7 @@ def eval_action_player(llm: LLMPlayer, gen: int=9, format: str='randombattle',
     if temp_action is None:
         temp_action = getattr(llm, 'temp_action', 0.0)
     if mt_action is None:
-        mt_action = getattr(llm, 'mt_action', 16)
+        mt_action = getattr(llm, 'mt_action', 120)
     format_str = 'ou'
     if 'randombattle' in format:
         format_str = 'rb'
@@ -419,7 +419,8 @@ def send_to_llm(llm: LLMPlayer,
     if temp_action is None:
         temp_action = getattr(llm, 'temp_action', 0.0)
     if mt_action is None:
-        mt_action = getattr(llm, 'mt_action', 10)
+        mt_action = getattr(llm, 'mt_action', 120)
+
     outputs = llm.llm.get_LLM_action_topK(system_prompt, prompt, '', actions=action_list, temperature=temp_action, json_format=True, seed=None, stop=[], max_tokens=mt_action, top_k=K)
     print(name, 'this is the action', action)
     print(outputs)
@@ -430,6 +431,7 @@ def send_to_llm(llm: LLMPlayer,
             print("invalid json", output)
             output = {}
             continue
+
         if 'move' in output.keys():
             output = output['move'].strip()
         elif 'switch' in output.keys():

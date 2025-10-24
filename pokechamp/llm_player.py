@@ -114,7 +114,7 @@ class LLMPlayer(Player):
         # Two-tier temperature and token settings with CLI override support
         # Tier 1: Action/Decision prompts (cold, structured JSON selection)
         self.temp_action = temp_action if temp_action is not None else 0.0
-        self.mt_action = mt_action if mt_action is not None else 16
+        self.mt_action = mt_action if mt_action is not None else 120
 
         # Tier 2: Expansion/Reasoning prompts (warmer, idea generation)
         self.temp_expand = temp_expand if temp_expand is not None else temperature
@@ -636,6 +636,10 @@ class LLMPlayer(Player):
         if self.prompt_algo == "io":
             return self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions)
 
+        # Improved IO with numbered contract and early gate
+        elif self.prompt_algo == "io2":
+            return self.io2(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions)
+
         # Self-consistency with k = 3
         elif self.prompt_algo == "sc":
             # Per-move timeout accounting for SC
@@ -742,16 +746,9 @@ class LLMPlayer(Player):
                 logger.warning("Minimax optimizer disabled, falling back to damage calculator")
                 return self._minimax_fallback(battle, start_time, reason='minimax_not_ready')
 
-            try:
-                action = self.tree_search_optimized(
-                    retries, battle, sim=sim, return_opp=False, start_time=start_time
-                )
-            except RuntimeError as exc:
-                logger.warning("Minimax runtime error: %s", exc)
-                return self._minimax_fallback(battle, start_time, reason='minimax_runtime_error')
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Unexpected minimax failure")
-                return self._minimax_fallback(battle, start_time, reason='minimax_exception')
+            action = self.tree_search_optimized(
+                retries, battle, sim=sim, return_opp=False, start_time=start_time
+            )
 
             progress_score = self._record_progress(battle)
             elapsed = time.time() - start_time
@@ -1130,6 +1127,200 @@ class LLMPlayer(Player):
                               action_kind=action_kind, action_label=action_label, max_tokens=self.max_tokens,
                               tokens_prompt=0, tokens_completion=0, near_timeout=near_timeout, progress_score=progress_score)
         
+        return next_action
+
+    def io2(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None):
+        """
+        Improved IO with:
+        - Numbered action contract {"pick": <int>}
+        - Action-tier temperature/tokens (colder, shorter)
+        - Early deterministic KO-race gate
+        - Robust fallbacks
+        """
+        next_action = None
+        # Cap retries for IO to avoid long stalls
+        retries = min(3, retries)
+
+        # Early deterministic fast-path: skip LLM if we clearly win TTK race
+        try:
+            dmg_move, our_ttk = self.dmg_calc_move(battle, return_move=True)
+            # If dmg_calc_move returns valid move, check if it's a clear win
+            if dmg_move is not None and our_ttk is not None and our_ttk != np.inf:
+                try:
+                    _, their_ttk = self.estimate_matchup(sim, battle, battle.opponent_active_pokemon, battle.active_pokemon, is_opp=True)
+                except Exception:
+                    their_ttk = float("inf")
+                try:
+                    we_move_first = battle.active_pokemon.stats['spe'] > battle.opponent_active_pokemon.stats['spe']
+                except Exception:
+                    we_move_first = False
+                our_effective_ttk = our_ttk + (0 if we_move_first else 1)
+                # Clear race edge: we kill in <=2 and strictly before their best line
+                if our_ttk <= 2 and our_effective_ttk < (their_ttk - 1):
+                    # Return the BattleOrder directly (dmg_move is already an order from dmg_calc_move with return_move=True)
+                    result_order = self.create_order(dmg_move) if hasattr(dmg_move, "id") else dmg_move
+                    if self.logger.level <= logging.DEBUG:
+                        print(f"IO2: Early KO-race exit (our TTK: {our_ttk}, theirs: {their_ttk})")
+                    return result_order
+        except Exception:
+            pass
+
+        # Deterministic, low-token contract: enumerate actions and request {"pick": <int>}
+        action_map = []
+        idx_lines = []
+        for mv in (battle.available_moves or []):
+            idx_lines.append(f"{len(action_map)}. move:{mv.id}")
+            action_map.append(self.create_order(mv))
+        for sw in (battle.available_switches or []):
+            idx_lines.append(f"{len(action_map)}. switch:{sw.species}")
+            action_map.append(self.create_order(sw))
+        
+        if not action_map:
+            # No legal actions - should be handled upstream but be safe
+            return self.choose_default_move()
+
+        indexed_block = "\n\nLEGAL_ACTIONS_INDEXED:\n" + "\n".join(idx_lines)
+
+        # Add concise tactical guardrails for stronger first-choice quality
+        tactical_guardrails = (
+            "\n\nTactical heuristics: "
+            "Avoid status into immunities (Thunder Wave→Ground/Electric, Toxic→Steel/Poison, powders→Grass); "
+            "prefer reliable KOs over low-accuracy gambles unless lethal; "
+            "avoid type-suicide into obvious OHKOs; "
+            "if a safe switch prevents a 2HKO while your attack takes ≥3 turns to KO, prefer the switch."
+        )
+        
+        # Keep reasoning cheap; "why" short
+        cot_prompt = '\nIn fewer than 3 sentences, think step by step:'
+        constraint_json = '\n\nReturn ONLY JSON: {"pick": <int>, "why":"<=20 tokens"}. Set pick to the index of your chosen action.'
+        state_prompt_io = state_prompt + state_action_prompt + indexed_block + tactical_guardrails + cot_prompt + constraint_json
+
+        # Per-move timeout start and accounting
+        start_time = time.time()
+        near_timeout_threshold = max(0.0, self.move_time_limit_s - 2.0)
+
+        for i in range(retries):
+            self._bump_llm_calls(battle)
+            # Timeout fallback
+            if time.time() - start_time > self.move_time_limit_s:
+                print('IO2 timeout, using damage calculator fallback')
+                move, _ = self.dmg_calc_move(battle)
+                if move is not None:
+                    return move
+                return self.choose_max_damage_move(battle)
+
+            try:
+                llm_output = self.get_LLM_action(
+                    system_prompt=system_prompt,
+                    user_prompt=state_prompt_io,
+                    model=self.backend,
+                    # Use action-tier knobs: colder temperature, reasonable token limit
+                    temperature=self.temp_action,
+                    max_tokens=max(80, min(self.mt_action, 160)),  # At least 80 for JSON response
+                    json_format=True,
+                    actions=actions
+                )
+
+                if DEBUG:
+                    print(f"IO2 Raw LLM output: {llm_output}")
+                
+                # Use forgiving JSON extraction (handles markdown fences, etc.)
+                llm_action_json = self._extract_json_obj(llm_output)
+                if not llm_action_json:
+                    if self.logger.level <= logging.DEBUG:
+                        print(f"IO2: Failed to extract JSON from: {llm_output[:200]}")
+                    raise ValueError("No valid JSON found in response")
+                
+                if DEBUG:
+                    print(f"IO2 Parsed JSON: {llm_action_json}")
+
+                # Support numbered contract: {"pick": <int>}
+                if "pick" in llm_action_json:
+                    try:
+                        pick = int(llm_action_json["pick"])
+                        if 0 <= pick < len(action_map):
+                            next_action = action_map[pick]
+                            if DEBUG:
+                                print(f"IO2: Selected action {pick}")
+                    except Exception:
+                        pass
+
+                # Fallback to old format if pick failed
+                if next_action is None and ("move" in llm_action_json or "switch" in llm_action_json):
+                    # Try to match using original logic (for backward compat)
+                    if "move" in llm_action_json:
+                        llm_move_id = llm_action_json["move"].strip()
+                        for move in battle.available_moves:
+                            if move.id.lower().replace(' ', '') == llm_move_id.lower().replace(' ', ''):
+                                next_action = self.create_order(move)
+                                break
+                    elif "switch" in llm_action_json:
+                        llm_switch_species = llm_action_json["switch"].strip()
+                        for pokemon in battle.available_switches:
+                            if pokemon.species.lower().replace(' ', '') == llm_switch_species.lower().replace(' ', ''):
+                                next_action = self.create_order(pokemon)
+                                break
+
+                if next_action is not None:
+                    # Dominance override: prefer clearly faster KOs
+                    try:
+                        mon = battle.active_pokemon
+                        opp = battle.opponent_active_pokemon
+                        # Best deterministic TTK from damage calc
+                        best_action, best_ttk = self.dmg_calc_move(battle)
+                        if best_action is not None and mon and opp and hasattr(next_action, "move") and next_action.move:
+                            if next_action.move.category != MoveCategory.STATUS:
+                                # TTK of the selected move
+                                sel_ttk = get_number_turns_faint(
+                                    mon, next_action.move, opp, sim,
+                                    boosts1=mon._boosts.copy(),
+                                    boosts2=opp.boosts.copy()
+                                )
+                                # If selected is ≥1 turn slower, override
+                                if sel_ttk > best_ttk + 1:
+                                    next_action = best_action
+                                    if self.logger.level <= logging.DEBUG:
+                                        print(f"IO2: Dominance override - selected TTK {sel_ttk} vs best {best_ttk}")
+                        # If LLM chose a switch but best_ttk ≤ 2 and we're safe, prefer the hit
+                        if best_action is not None and hasattr(next_action, "pokemon") and next_action.pokemon and best_ttk <= 2:
+                            next_action = best_action
+                            if self.logger.level <= logging.DEBUG:
+                                print(f"IO2: Dominance override - switch vs clean 2HKO")
+                    except Exception:
+                        pass
+
+                    # Record metrics
+                    near_timeout = (time.time() - start_time) > near_timeout_threshold
+                    if near_timeout:
+                        self._record_timeout(battle, avoided=True)
+                    action_kind = 'move' if any(hasattr(next_action, 'move') and next_action.move for _ in [1]) else 'switch'
+                    action_label = ''
+                    if hasattr(next_action, 'move') and next_action.move:
+                        action_label = next_action.move.id
+                    elif hasattr(next_action, 'pokemon') and next_action.pokemon:
+                        action_label = next_action.pokemon.species
+                    progress_score = self._record_progress(battle)
+                    self._record_metric(battle, start_time, json_ok=True, fallback_reason='', 
+                                      action_kind=action_kind, action_label=action_label, 
+                                      max_tokens=max(80, min(self.mt_action, 160)), tokens_prompt=0, tokens_completion=0, 
+                                      near_timeout=near_timeout, progress_score=progress_score)
+                    break
+
+            except Exception as e:
+                print(f'IO2 Exception [{self.backend}]: {e}')
+                continue
+
+        # Final fallback chain
+        if next_action is None:
+            print('IO2: No valid action found, using robust fallback')
+            raw_text = llm_output if 'llm_output' in locals() else ''
+            next_action = self._finalize_action(None, raw_text, battle)
+            progress_score = self._record_progress(battle)
+            self._record_metric(battle, start_time, json_ok=False, fallback_reason='io2_fallback',
+                              action_kind='safe_default', action_label='', 
+                              max_tokens=min(self.mt_action, 160), tokens_prompt=0, tokens_completion=0,
+                              near_timeout=False, progress_score=progress_score)
+
         return next_action
 
     def _extract_json_obj(self, s: str) -> Optional[Dict[str, Any]]:
@@ -2472,14 +2663,15 @@ Score each action and return the complete ranking array."""
 
             q = deque([root])  # O(1) popleft instead of O(n) pop(0)
             leaf_nodes = []
+            expanded_any = False  # Track if we've done at least one expansion
 
             # End initialization, start expansion loop
             timer.pop()  # initialization
             timer.push('expansion_loop')
 
             while len(q) != 0:
-                # Check timeout before processing next node
-                if time.time() > minimax_deadline:
+                # If time ran out AND we've expanded at least once, bail to selection
+                if time.time() > minimax_deadline and expanded_any:
                     print(f'Minimax timeout: explored {len(leaf_nodes)} leaf nodes, returning best so far')
                     # If we have any children, proceed to selection with heuristics
                     if leaf_nodes or root.children:
@@ -2867,6 +3059,26 @@ Score each action and return the complete ranking array."""
                             print(f"DEBUG: No actions to expand at depth {node.depth} - player_actions: {len(player_actions) if player_actions else 0}, opponent_actions: {len(opponent_actions) if opponent_actions else 0}")
 
                     if player_actions and opponent_actions:
+                        # Order by 1-ply threat proxy: prioritize high-impact expansions
+                        def _threat_score(order, us=True):
+                            try:
+                                if hasattr(order, "move") and order.move:
+                                    mv = order.move
+                                    bp = float(getattr(mv, "base_power", 0) or 0)
+                                    acc = float(getattr(mv, "accuracy", 1.0) or 1.0)
+                                    b_ = node.simulation.battle
+                                    atk = b_.active_pokemon if us else b_.opponent_active_pokemon
+                                    dfn = b_.opponent_active_pokemon if us else b_.active_pokemon
+                                    stab = 1.5 if (mv.type and mv.type in getattr(atk, "types", [])) else 1.0
+                                    eff = dfn.damage_multiplier(mv.type) if (dfn and mv.type) else 1.0
+                                    return bp * acc * stab * eff
+                            except Exception:
+                                pass
+                            return 0.0
+                        
+                        player_actions.sort(key=lambda a: _threat_score(a, us=True), reverse=True)
+                        opponent_actions.sort(key=lambda a: _threat_score(a, us=False), reverse=True)
+
                         # Further limit branching if we're running low on time
                         time_remaining = minimax_deadline - time.time()
                         total_legal = len(player_actions) + len(opponent_actions)
@@ -2899,6 +3111,7 @@ Score each action and return the complete ranking array."""
                                     # Count cache-satisfied children at target depth as leaves
                                     if child_node.depth >= effective_K:
                                         leaf_nodes.append(child_node)
+                                    expanded_any = True
                                     # Don't increment nodes_created or add to queue - this is a cache hit
                                 else:
                                     # Parent-action cache miss - create child and check state-value cache
@@ -2920,6 +3133,7 @@ Score each action and return the complete ranking array."""
                                         # Count cache-satisfied children at target depth as leaves
                                         if child_node.depth >= effective_K:
                                             leaf_nodes.append(child_node)
+                                        expanded_any = True
 
                                         # Also cache the (parent, action_p, action_o) edge
                                         p_key = mk_ttkey(node.simulation.battle)
@@ -2941,6 +3155,7 @@ Score each action and return the complete ranking array."""
                                         # Add to queue for further expansion
                                         q.append(child_node)
                                         node.children.append(child_node)
+                                        expanded_any = True
 
             # End expansion loop
             timer.pop()  # expansion_loop
@@ -2960,8 +3175,10 @@ Score each action and return the complete ranking array."""
                 # Apply scores and cache
                 for node, score in zip(unevaluated_leaves, scores):
                     if score is not None:
-                        node.hp_diff = float(score)
-                        assert 0.0 <= node.hp_diff <= 100.0, f"Invalid score: {node.hp_diff}"
+                        raw_score = float(score)
+                        if not (0.0 <= raw_score <= 100.0):
+                            print(f"⚠️  Leaf score out of range: {raw_score}, clamping to [0,100]")
+                        node.hp_diff = max(0.0, min(100.0, raw_score))
                         # Cache both TT and parent-edge
                         depth_remaining = self.K - node.depth
                         child_tt_key = mk_ttkey(node.simulation.battle)
@@ -2985,8 +3202,10 @@ Score each action and return the complete ranking array."""
                         team_p = sum(not p.fainted for p in b.team.values())
                         team_o = sum(not p.fainted for p in b.opponent_team.values())
                         v = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)  # 0..100
-                        node.hp_diff = float(v) # v in 0...100
-                        assert 0.0 <= node.hp_diff <= 100.0, f"Invalid heuristic: {node.hp_diff}"
+                        raw_v = float(v)
+                        if not (0.0 <= raw_v <= 100.0):
+                            print(f"⚠️  Heuristic out of range: {raw_v}, clamping to [0,100]")
+                        node.hp_diff = max(0.0, min(100.0, raw_v))
 
                         # Cache the fallback evaluation
                         depth_remaining = self.K - node.depth
@@ -3016,8 +3235,10 @@ Score each action and return the complete ranking array."""
                             team_p = sum(not p.fainted for p in b.team.values())
                             team_o = sum(not p.fainted for p in b.opponent_team.values())
                             v = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)  # 0..100
-                            node.hp_diff = float(v) # v in 0...100
-                            assert 0.0 <= node.hp_diff <= 100.0, f"Invalid heuristic: {node.hp_diff}"
+                            raw_v = float(v)
+                            if not (0.0 <= raw_v <= 100.0):
+                                print(f"⚠️  Heuristic out of range: {raw_v}, clamping to [0,100]")
+                            node.hp_diff = max(0.0, min(100.0, raw_v))
 
                             # Cache
                             depth_remaining = self.K - node.depth
@@ -3223,7 +3444,7 @@ Score each action and return the complete ranking array."""
                             action_opp, _ = self.estimate_matchup(None, battle, 
                                                                battle.opponent_active_pokemon, 
                                                                battle.active_pokemon, is_opp=True)
-                            return dmg_calc_move, self.create_order(action_opp) if action_opp else None
+                            return dmg_calc_move, action_opp if action_opp else None
                         except:
                             return dmg_calc_move, None
                     return dmg_calc_move
@@ -3318,7 +3539,29 @@ Score each action and return the complete ranking array."""
         return to_return
 
     def choose_max_damage_move(self, battle: Battle):
+        """
+        Choose move with highest expected damage, accounting for:
+        - Type effectiveness
+        - Accuracy
+        - Disabled status
+        """
         if battle.available_moves:
-            best_move = max(battle.available_moves, key=lambda move: (getattr(move, 'base_power', 0) or 0))
+            opp = getattr(battle, 'opponent_active_pokemon', None)
+
+            def _score(m):
+                # Skip disabled moves
+                if getattr(m, 'disabled', False):
+                    return -1.0
+                bp = float(getattr(m, 'base_power', 0) or 0)
+                acc = float(getattr(m, 'accuracy', 1.0) or 1.0)
+                mult = 1.0
+                try:
+                    if opp is not None and getattr(m, 'type', None) is not None:
+                        mult = float(opp.damage_multiplier(m.type))
+                except Exception:
+                    mult = 1.0
+                return bp * acc * mult
+
+            best_move = max(battle.available_moves, key=_score)
             return self.create_order(best_move)
         return self.choose_random_move(battle)

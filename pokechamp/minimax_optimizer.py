@@ -283,8 +283,7 @@ class LocalSimPool:
             self._available_sims.append(sim)
 
     def release_all(self):
-        """Release all inMixed score scales (0–1 vs 0–100) at leaves
-Some leaves are scored on a 0–100 scale (fast heuristic, single‑leaf LLM), others on 0–1 (batched LLM + fallbacks). That skews action selection and forces extra expansions (and therefore time) because apples and oranges are being compared. (Functions: score_leaves_batch, tree_search_optimized fallback branches.-use sims back to the pool."""
+        """Release all in-use sims back to the pool."""
         for sim in self._in_use_sims[:]:  # Copy list to avoid modification during iteration
             self.release_sim(sim)
 
