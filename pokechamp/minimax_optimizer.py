@@ -26,7 +26,7 @@ class TTKey:
     Excludes turn_number to allow transposition across turns.
     HP coarse-grained to deciles to improve hit rate.
     """
-    active_hp_deciles: Tuple[int, int]              # (us, opp), 0..5 (quintiles)
+    active_hp_deciles: Tuple[int, int]              # (us, opp), 0..10 (deciles)
     active_species: Tuple[str, str]                 # normalized species ids
     fainted_count: Tuple[int, int]                  # (our_fainted, opp_fainted)
     our_side: Tuple[Tuple[str, int], ...]           # hazards/screens on our side
@@ -146,10 +146,10 @@ def mk_ttkey(battle: Battle) -> TTKey:
         u = battle.active_pokemon
         o = battle.opponent_active_pokemon
         
-        # HP as quintiles (0-5) for much better cache hits
+        # HP as deciles (0–10) for better discrimination without blowing up the table
         active_hp_deciles = (
-            int((u.current_hp_fraction if u else 0) * 5),
-            int((o.current_hp_fraction if o else 0) * 5)
+            int((u.current_hp_fraction if u else 0) * 10),
+            int((o.current_hp_fraction if o else 0) * 10)
         )
 
         # Normalized species
@@ -203,10 +203,10 @@ def mk_ttkey(battle: Battle) -> TTKey:
         # Tera flags
         try:
             tera_flags = (
-                int(getattr(u, "terastallized", False) if u else False or not battle.can_tera),
-                int(getattr(o, "terastallized", False) if o else False or not battle.opponent_can_tera)
+                int(((getattr(u, "terastallized", False) if u else False) or (not getattr(battle, "can_tera", True)))),
+                int(((getattr(o, "terastallized", False) if o else False) or (not getattr(battle, "opponent_can_tera", True))))
             )
-        except:
+        except Exception:
             tera_flags = (0, 0)
         
         return TTKey(
@@ -360,7 +360,19 @@ class MinimaxCache:
         return self._hits, self._misses, hit_rate
 
 
-@dataclass(slots=True)
+class CachedChildNode:
+    """Lightweight node for cached evaluations (no sim needed)."""
+    def __init__(self, action, action_opp, hp_diff, parent):
+        self.action = action
+        self.action_opp = action_opp
+        self.hp_diff = hp_diff
+        self.parent_node = parent
+        self.parent_action = parent.action
+        self.children = []
+        self.depth = parent.depth + 1
+        self.simulation = None  # No sim needed for cached nodes
+
+
 class OptimizedSimNode:
     """Optimized version of SimNode that uses object pooling and caching."""
 
@@ -580,7 +592,7 @@ def fast_battle_evaluation(
     
     - HP contribution: linear weight 0.6 per 1% HP edge (±60 max)
     - Team contribution: 15 points per mon edge (±90 max)
-    - Turn penalty: up to -10 to encourage quicker wins
+    - Note: no explicit turn penalty (keeps values stationary for TT reuse)
     """
     # Guard inputs
     php = max(0, min(100, int(active_hp_player)))
@@ -592,11 +604,8 @@ def fast_battle_evaluation(
     # Team advantage
     team_advantage = (int(team_count_player) - int(team_count_opp)) * 15  # ±90
 
-    # Turn penalty (encourages quicker wins)
-    turn_penalty = min(max(0.0, float(turn)) * 0.5, 10)
-
-    # Base score starts at 50 (neutral)
-    score = 50 + hp_advantage + team_advantage - turn_penalty
+    # Base score starts at 50 (neutral). No turn penalty to keep cache stationary.
+    score = 50 + hp_advantage + team_advantage
 
     # Clamp to valid range
     return max(0.0, min(100.0, float(score)))

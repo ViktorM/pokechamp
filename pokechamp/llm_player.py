@@ -45,6 +45,7 @@ from pokechamp.minimax_optimizer import (
     fast_battle_evaluation,
     create_battle_state_hash,
     OptimizedSimNode,
+    CachedChildNode,
     mk_ttkey,
     canonical_action
 )
@@ -56,20 +57,6 @@ from pokechamp.gen1_quirks import Gen1Quirks
 
 DEBUG = False
 logger = logging.getLogger(__name__)
-
-
-@dataclass(slots=True)
-class CachedChildNode:
-    """Lightweight node for cached evaluations (no sim needed)."""
-    def __init__(self, action, action_opp, hp_diff, parent):
-        self.action = action
-        self.action_opp = action_opp
-        self.hp_diff = hp_diff
-        self.parent_node = parent
-        self.parent_action = parent.action
-        self.children = []
-        self.depth = parent.depth + 1
-        self.simulation = None  # No sim needed for cached nodes
 
 
 class LLMPlayer(Player):
@@ -644,7 +631,7 @@ class LLMPlayer(Player):
         state_prompt_tot_1 = state_prompt + state_action_prompt + constraint_prompt_tot_1
         state_prompt_tot_2 = state_prompt + state_action_prompt + constraint_prompt_tot_2
 
-        retries = 10
+        retries = 5
         # Chain-of-thought
         if self.prompt_algo == "io":
             return self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions)
@@ -738,7 +725,8 @@ class LLMPlayer(Player):
                                             "llm_output2": llm_output2,
                                             "battle_tag": battle.battle_tag
                                             }) + "\n")
-                    if next_action is not None:     break
+                    if next_action is not None:
+                        break
                 except:
                     raise ValueError('No valid move', battle.active_pokemon.fainted, len(battle.available_switches))
                     continue
@@ -1982,7 +1970,7 @@ class LLMPlayer(Player):
         return best_move, best_move_turns
 
     def dmg_calc_move(self, battle: AbstractBattle, return_move: bool=False):
-        sim = LocalSim(battle, 
+        sim = LocalSim(deepcopy(battle), 
                     self.move_effect,
                     self.pokemon_move_dict,
                     self.ability_effect,
@@ -2162,9 +2150,9 @@ class LLMPlayer(Player):
             
             if action_type == "move":
                 if is_opp:
-                    # For opponent, create order with move string
-                    # This is how estimate_matchup returns moves for opponents
-                    return self.create_order(action_id)
+                    # Build a Move object for opponent orders (not a raw string)
+                    mv = Move(action_id, gen=getattr(self.gen, "gen", 9))
+                    return self.create_order(mv)
                 else:
                     # Find matching move for player
                     moves = battle.available_moves
@@ -2174,9 +2162,12 @@ class LLMPlayer(Player):
                             return self.create_order(move)
             elif action_type == "switch":
                 if is_opp:
-                    # For opponent, create order with species string
-                    # This is how estimate_matchup returns switches for opponents
-                    return self.create_order(action_id)
+                    # Map species id to the actual opponent Pokemon object
+                    for mon in battle.opponent_team.values():
+                        species = getattr(mon, 'species', '').lower().replace(" ", "").replace("-", "")
+                        if species == action_id and not getattr(mon, 'fainted', False):
+                            return self.create_order(mon)
+                    return None
                 else:
                     # Find matching switch for player
                     switches = battle.available_switches
@@ -2303,20 +2294,20 @@ Positions to evaluate:
 
             result = self._extract_json_obj(llm_output)
             if not result or "scores" not in result:
-                return [0.5] * len(leaves)  # Neutral fallback
+                return [50.0] * len(leaves)  # Neutral fallback on 0-100 scale
 
             scores = result.get("scores", [])
-            # Clamp to [0,1] and pad if needed
+            # Clamp to [0,100] and pad if needed
             clamped = [float(max(0.0, min(100.0, s))) for s in scores]
             while len(clamped) < len(leaves):
-                clamped.append(0.5)
+                clamped.append(50.0)  # Neutral on 0-100 scale
 
             return clamped[:len(leaves)]
 
         except Exception as e:
             if self.logger.level <= logging.DEBUG:
                 print(f"Batched leaf scoring failed: {e}")
-            return [0.5] * len(leaves)  # Neutral fallback
+            return [50.0] * len(leaves)  # Neutral fallback on 0-100 scale
 
     def rank_actions_batched(self, battle, sim=None, start_time=None):
         """
@@ -2459,7 +2450,7 @@ Score each action and return the complete ranking array."""
                                 action_opp, _ = self.estimate_matchup(root.simulation, battle, 
                                                                    battle.opponent_active_pokemon, 
                                                                    battle.active_pokemon, is_opp=True)
-                                return dmg_calc_out, self.create_order(action_opp) if action_opp else None
+                                return dmg_calc_out, action_opp if action_opp else None
                             except:
                                 return dmg_calc_out, None
                         return dmg_calc_out
@@ -2713,7 +2704,7 @@ Score each action and return the complete ranking array."""
                                                                       b.opponent_active_pokemon,
                                                                       b.active_pokemon, is_opp=True)
                         if action_opp:
-                            opponent_actions.append(self.create_order(action_opp))
+                            opponent_actions.append(action_opp)
 
                         # Best switch (heuristic) - higher score = better for opponent
                         best_score = -np.inf
@@ -2766,6 +2757,13 @@ Score each action and return the complete ranking array."""
                                 if not any(getattr(a, 'order', None) == candidate.order for a in player_actions):
                                     player_actions.append(candidate)
                                     break
+                        # Add one STATUS/setup/hazard move for tactical variety (if present)
+                        for mv in b.available_moves:
+                            if getattr(mv, 'category', None) == MoveCategory.STATUS:
+                                candidate = self.create_order(mv)
+                                if not any(getattr(a, 'order', None) == candidate.order for a in player_actions):
+                                    player_actions.append(candidate)
+                                    break
 
                     # Add best switch if available
                     if b.available_switches:
@@ -2802,7 +2800,7 @@ Score each action and return the complete ranking array."""
 
                     # Generate opponent actions (always ensure ≥2: damage + pivot)
                     if action_opp is not None:
-                        opponent_actions.append(self.create_order(action_opp))
+                        opponent_actions.append(action_opp)
 
                     # Add best defensive pivot/switch - picks mon that resists our best move type
                     if len(opponent_actions) < 2 and b.available_moves:
@@ -3062,12 +3060,20 @@ Score each action and return the complete ranking array."""
                 legal_moves = battle.available_moves or []
                 legal_switches = battle.available_switches or []
 
+                # Provide a default opponent reply so LocalSim.step() can advance
+                opp_default = None
+                b0 = root.simulation.battle
+                if b0 and b0.opponent_active_pokemon and b0.active_pokemon:
+                    opp_moves = getattr(b0.opponent_active_pokemon, 'moves', None)
+                    if opp_moves:
+                        opp_default, _ = self.estimate_matchup(root.simulation, b0, b0.opponent_active_pokemon, b0.active_pokemon, is_opp=True)
+
                 if self.logger.level <= logging.DEBUG:
                     print(f"DEBUG: Root has no children, forcing enumeration of {len(legal_moves)} moves and {len(legal_switches)} switches")
 
                 for mv in legal_moves:
                     try:
-                        child_node = root.create_child_node(self.create_order(mv), None)
+                        child_node = root.create_child_node(self.create_order(mv), opp_default)
                         optimizer.stats['nodes_created'] += 1
                         root.children.append(child_node)
                     except Exception as e:
@@ -3076,7 +3082,7 @@ Score each action and return the complete ranking array."""
 
                 for sw in legal_switches:
                     try:
-                        child_node = root.create_child_node(self.create_order(sw), None)
+                        child_node = root.create_child_node(self.create_order(sw), opp_default)
                         optimizer.stats['nodes_created'] += 1
                         root.children.append(child_node)
                     except Exception as e:
