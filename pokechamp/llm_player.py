@@ -1,5 +1,7 @@
 import ast
 from copy import copy, deepcopy
+from collections import deque
+from dataclasses import dataclass
 import datetime
 import json
 import os
@@ -56,6 +58,7 @@ DEBUG = False
 logger = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
 class CachedChildNode:
     """Lightweight node for cached evaluations (no sim needed)."""
     def __init__(self, action, action_opp, hp_diff, parent):
@@ -2476,7 +2479,7 @@ Score each action and return the complete ranking array."""
             else:
                 effective_K = self.K  # Full depth when we have time
 
-            q = [root]
+            q = deque([root])  # O(1) popleft instead of O(n) pop(0)
             leaf_nodes = []
 
             # End initialization, start expansion loop
@@ -2496,7 +2499,7 @@ Score each action and return the complete ranking array."""
                         return dmg_calc_out
                     return self.choose_max_damage_move(battle)
 
-                node = q.pop(0)
+                node = q.popleft()
 
                 # Unify battle reference and initialize action lists once per node
                 b = node.simulation.battle
@@ -2895,6 +2898,9 @@ Score each action and return the complete ranking array."""
                                     # Create a minimal child node without acquiring sim (no stepping needed)
                                     child_node = CachedChildNode(action_p, action_o, cached_value, node)
                                     node.children.append(child_node)
+                                    # Count cache-satisfied children at target depth as leaves
+                                    if child_node.depth >= effective_K:
+                                        leaf_nodes.append(child_node)
                                     # Don't increment nodes_created or add to queue - this is a cache hit
                                 else:
                                     # Parent-action cache miss - create child and check state-value cache
@@ -2913,6 +2919,9 @@ Score each action and return the complete ranking array."""
                                         child_node.hp_diff = state_value
                                         # Still add as child but mark as evaluated
                                         node.children.append(child_node)
+                                        # Count cache-satisfied children at target depth as leaves
+                                        if child_node.depth >= effective_K:
+                                            leaf_nodes.append(child_node)
 
                                         # Also cache the (parent, action_p, action_o) edge
                                         p_key = mk_ttkey(node.simulation.battle)
