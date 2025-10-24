@@ -360,6 +360,7 @@ class MinimaxCache:
         return self._hits, self._misses, hit_rate
 
 
+@dataclass(slots=True)
 class OptimizedSimNode:
     """Optimized version of SimNode that uses object pooling and caching."""
 
