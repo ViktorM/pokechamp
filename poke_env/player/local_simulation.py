@@ -151,7 +151,7 @@ class LocalSim():
 
         self.SPEED_TIER_COEFICIENT = 0.1
         self.HP_FRACTION_COEFICIENT = 0.4
-        
+
         # Use cached moves set data instead of loading file
         if get_cached_moves_set is not None:
             self.moves_set = get_cached_moves_set(self.format)
@@ -163,7 +163,6 @@ class LocalSim():
                     self.moves_set = orjson.loads(f.read())
             else:
                 self.moves_set = {}
-
 
     def get_llm_system_prompt(self, _format: str, llm: GPTPlayer | LLAMAPlayer = None, team_str: str=None, model: str='gpt-4o'):
         # sleep to make sure server has sent pokemon team information first
@@ -202,7 +201,7 @@ class LocalSim():
             self.strategy, _ = llm.get_LLM_query("", strategy_prompt, max_tokens=1000, model=model)
             # print(self.strategy)
         return self.strategy
-    
+
     def step_llm(self, action1, action2, llm, model, m1, m2, temperature=0.7, max_tokens=200):
         # get active pokemon stats
         # opponent pokemon
@@ -217,6 +216,7 @@ class LocalSim():
                 type_2 = self.battle.opponent_active_pokemon.type_2.name
                 opponent_type = opponent_type + " and " + type_2.capitalize()
                 opponent_type_list.append(type_2)
+
         species = self.battle.opponent_active_pokemon.species
         if species == 'polteageistantique':
             species = 'polteageist'
@@ -348,6 +348,7 @@ class LocalSim():
                     break
             msg = ['', 'switch', f'{player_tag}: {action1_name}', '', f'{player_health}/100']
             msg_all.append(msg)
+
         if 'switch' in action2:
             # get switched pokemon health
             opponent_health = 100
@@ -357,10 +358,10 @@ class LocalSim():
                     break
             msg = ['', 'switch', f'{opponent_tag}: {action2_name}', '', f'{opponent_health}/100']
             msg_all.append(msg)
+
         for request in msg_all:
             # print("[local sim msg]", request)
             self._handle_battle_message(request)
-
 
         '''ADVANCE WORLD'''
         move1 = m1 if isinstance(m1, Move) else None
@@ -1387,7 +1388,7 @@ class LocalSim():
             '''
 
         return boosts
-    
+
     def calc_base_dmg(self, 
                       pokemon: Pokemon, 
                       target: Pokemon, 
@@ -1564,7 +1565,7 @@ class LocalSim():
         # expected value with accuracy
         if use_expected:
             baseDamage *= move.accuracy
-        
+
         # print(f'gen {baseDamage}')
         # ...but 16-bit truncation happens even later, and can truncate to 0
         return int(baseDamage) * move.expected_hits

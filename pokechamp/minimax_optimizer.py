@@ -183,7 +183,7 @@ def mk_ttkey(battle: Battle) -> TTKey:
         try:
             player_boosts = u.boosts if u else {}
             opp_boosts = o.boosts if o else {}
-            
+
             # Only track value-driving boosts (drop accuracy for most gens)
             boosts = (
                 _boost_bucket(player_boosts.get('atk', 0)), 
@@ -199,7 +199,7 @@ def mk_ttkey(battle: Battle) -> TTKey:
             )
         except:
             boosts = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        
+
         # Tera flags
         try:
             tera_flags = (
@@ -283,7 +283,8 @@ class LocalSimPool:
             self._available_sims.append(sim)
 
     def release_all(self):
-        """Release all in-use sims back to the pool."""
+        """Release all inMixed score scales (0–1 vs 0–100) at leaves
+Some leaves are scored on a 0–100 scale (fast heuristic, single‑leaf LLM), others on 0–1 (batched LLM + fallbacks). That skews action selection and forces extra expansions (and therefore time) because apples and oranges are being compared. (Functions: score_leaves_batch, tree_search_optimized fallback branches.-use sims back to the pool."""
         for sim in self._in_use_sims[:]:  # Copy list to avoid modification during iteration
             self.release_sim(sim)
 
@@ -380,11 +381,8 @@ class OptimizedSimNode:
 
     def create_child_node(self, player_action: BattleOrder, opp_action: BattleOrder) -> 'OptimizedSimNode':
         """Create a child node efficiently."""
-        # Create new battle state by stepping forward
-        child_battle = deepcopy(self.simulation.battle)
-
-        # Create child node
-        child_node = OptimizedSimNode(child_battle, self.sim_pool, self.depth + 1)
+        # Avoid double deepcopy: acquire_sim will deepcopy the battle internally
+        child_node = OptimizedSimNode(self.simulation.battle, self.sim_pool, self.depth + 1)
         child_node.action = player_action
         child_node.action_opp = opp_action
         child_node.parent_node = self
@@ -392,7 +390,7 @@ class OptimizedSimNode:
 
         # Step the simulation forward
         child_node.simulation.step(player_action, opp_action)
-        
+
         # Update relationships
         self.children.append(child_node)
 
@@ -412,7 +410,7 @@ class MinimaxOptimizer:
     """Main optimizer for minimax tree search."""
 
     def __init__(self):
-        self.sim_pool = LocalSimPool(initial_size=4)  # Larger pool for minimax
+        self.sim_pool = LocalSimPool(initial_size=8)  # Larger pool for minimax
         self.cache = MinimaxCache(max_size=2000)  # (parent, action, opp) cache
         self.state_value_cache: Dict[TTKey, Tuple[float, int]] = {}  # child state → (value, depth) cache
         self.stats = {
@@ -533,7 +531,7 @@ class MinimaxOptimizer:
             },
             'total_time': self.stats['total_time']
         }
-    
+
     def reset_stats(self):
         """Reset performance statistics."""
         self.stats = {
@@ -577,24 +575,27 @@ def fast_battle_evaluation(
     turn: int
 ) -> float:
     """
-    Fast heuristic evaluation function that avoids LLM calls.
+    Fast heuristic evaluation using consistent 0–100 HP inputs.
     
-    This provides a quick approximation of battle state value based on:
-    - HP advantage
-    - Team size advantage  
-    - Turn progression penalty
+    - HP contribution: linear weight 0.6 per 1% HP edge (±60 max)
+    - Team contribution: 15 points per mon edge (±90 max)
+    - Turn penalty: up to -10 to encourage quicker wins
     """
-    # HP advantage (0-100 scale)
-    hp_advantage = (active_hp_player - active_hp_opp) * 20
-    
-    # Team advantage (each Pokemon worth ~15 points)
-    team_advantage = (team_count_player - team_count_opp) * 15
-    
+    # Guard inputs
+    php = max(0, min(100, int(active_hp_player)))
+    ohp = max(0, min(100, int(active_hp_opp)))
+
+    # HP advantage (scale 0..100)
+    hp_advantage = (php - ohp) * 0.6  # ±60
+
+    # Team advantage
+    team_advantage = (int(team_count_player) - int(team_count_opp)) * 15  # ±90
+
     # Turn penalty (encourages quicker wins)
-    turn_penalty = min(turn * 0.5, 10)
-    
+    turn_penalty = min(max(0.0, float(turn)) * 0.5, 10)
+
     # Base score starts at 50 (neutral)
     score = 50 + hp_advantage + team_advantage - turn_penalty
-    
+
     # Clamp to valid range
-    return max(0, min(100, score))
+    return max(0.0, min(100.0, float(score)))
