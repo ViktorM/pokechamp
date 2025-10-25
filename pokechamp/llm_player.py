@@ -3148,10 +3148,48 @@ Score each action and return the complete ranking array."""
                                             hp_o = int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100)
                                             team_p = sum(not p.fainted for p in b.team.values())
                                             team_o = sum(not p.fainted for p in b.opponent_team.values())
-                                            child_node.hp_diff = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+                                            base_score = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+
+                                            # Add speed edge bonus
+                                            spe_bonus = 0.0
+                                            me, opp = b.active_pokemon, b.opponent_active_pokemon
+                                            if me and opp and me.stats and opp.stats:
+                                                my_spe = me.stats.get('spe')
+                                                if my_spe is None:
+                                                    if self.logger.level <= logging.DEBUG:
+                                                        print(f"⚠️  Speed stat is None for {me.species}")
+                                                    my_spe = 0.0
+                                                opp_spe = opp.stats.get('spe')
+                                                if opp_spe is None:
+                                                    if self.logger.level <= logging.DEBUG:
+                                                        print(f"⚠️  Speed stat is None for opponent {opp.species}")
+                                                    opp_spe = 0.0
+                                                if my_spe > opp_spe:
+                                                    spe_bonus = 5.0
+                                                elif my_spe < opp_spe:
+                                                    spe_bonus = -5.0
+
+                                            # Add type pressure edge
+                                            type_bonus = 0.0
+                                            def _best_eff(attacker, defender, moves):
+                                                effs = []
+                                                for mv in (moves or []):
+                                                    try:
+                                                        if getattr(mv, 'base_power', 0) and getattr(mv, 'type', None):
+                                                            effs.append(defender.damage_multiplier(mv.type))
+                                                    except Exception:
+                                                        pass
+                                                return max(effs) if effs else 1.0
+
+                                            our_eff = _best_eff(b.active_pokemon, b.opponent_active_pokemon, b.available_moves)
+                                            their_eff = _best_eff(b.opponent_active_pokemon, b.active_pokemon,
+                                                                 getattr(b.opponent_active_pokemon, 'moves', {}).values())
+                                            type_bonus = max(-10.0, min(10.0, 5.0 * (our_eff - their_eff)))
+
+                                            child_node.hp_diff = base_score + spe_bonus + type_bonus
                                             # Cache this immediate heuristic
                                             optimizer.cache_state_value(child_tt_key, float(child_node.hp_diff), child_min_depth)
-                                        
+
                                         # Add to queue for further expansion
                                         q.append(child_node)
                                         node.children.append(child_node)
@@ -3244,7 +3282,7 @@ Score each action and return the complete ranking array."""
                             depth_remaining = self.K - node.depth
                             child_tt_key = mk_ttkey(b)
                             optimizer.cache_state_value(child_tt_key, node.hp_diff, depth_remaining)
-                            
+
                             if node.parent_node and hasattr(node, 'action') and hasattr(node, 'action_opp'):
                                 parent_key = mk_ttkey(node.parent_node.simulation.battle)
                                 p = canonical_action(node.action, tera=getattr(b, '_tera_intent', False))
@@ -3254,7 +3292,7 @@ Score each action and return the complete ranking array."""
             # End batch eval
             timer.pop()  # batch_eval
 
-            # Ensure root children have values before selection (fill with heuristic if missing)
+            # Ensure root children have values before selection (fill with richer heuristic if missing)
             if root.children:
                 for child in root.children:
                     if getattr(child, 'hp_diff', None) is None and getattr(child, 'simulation', None) is not None:
@@ -3263,8 +3301,45 @@ Score each action and return the complete ranking array."""
                         hp_o = int((b.opponent_active_pokemon.current_hp_fraction or 0) * 100)
                         team_p = sum(not p.fainted for p in b.team.values())
                         team_o = sum(not p.fainted for p in b.opponent_team.values())
-                        v = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
-                        child.hp_diff = float(v)
+                        base_score = fast_battle_evaluation(hp_p, hp_o, team_p, team_o, b.turn)
+
+                        # Add speed edge bonus
+                        spe_bonus = 0.0
+                        me, opp = b.active_pokemon, b.opponent_active_pokemon
+                        if me and opp and me.stats and opp.stats:
+                            my_spe = me.stats.get('spe')
+                            if my_spe is None:
+                                if self.logger.level <= logging.DEBUG:
+                                    print(f"⚠️  Speed stat is None for {me.species}")
+                                my_spe = 0.0
+                            opp_spe = opp.stats.get('spe')
+                            if opp_spe is None:
+                                if self.logger.level <= logging.DEBUG:
+                                    print(f"⚠️  Speed stat is None for opponent {opp.species}")
+                                opp_spe = 0.0
+                            if my_spe > opp_spe:
+                                spe_bonus = 5.0
+                            elif my_spe < opp_spe:
+                                spe_bonus = -5.0
+
+                        # Add type pressure edge
+                        type_bonus = 0.0
+                        def _best_eff(attacker, defender, moves):
+                            effs = []
+                            for mv in (moves or []):
+                                try:
+                                    if getattr(mv, 'base_power', 0) and getattr(mv, 'type', None):
+                                        effs.append(defender.damage_multiplier(mv.type))
+                                except Exception:
+                                    pass
+                            return max(effs) if effs else 1.0
+
+                        our_eff = _best_eff(b.active_pokemon, b.opponent_active_pokemon, b.available_moves)
+                        their_eff = _best_eff(b.opponent_active_pokemon, b.active_pokemon,
+                                             getattr(b.opponent_active_pokemon, 'moves', {}).values())
+                        type_bonus = max(-10.0, min(10.0, 5.0 * (our_eff - their_eff)))
+
+                        child.hp_diff = base_score + spe_bonus + type_bonus
                         # Cache minimal info to help future reuse
                         depth_remaining = max(0, self.K - child.depth)
                         child_tt_key = mk_ttkey(b)

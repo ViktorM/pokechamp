@@ -581,30 +581,51 @@ def initialize_minimax_optimization(battle: Battle, **localsim_kwargs):
 @lru_cache(maxsize=500)
 def fast_battle_evaluation(
     active_hp_player: int,
-    active_hp_opp: int, 
+    active_hp_opp: int,
     team_count_player: int,
     team_count_opp: int,
-    turn: int
+    turn: int,
 ) -> float:
     """
-    Fast heuristic evaluation using consistent 0–100 HP inputs.
-    
-    - HP contribution: linear weight 0.6 per 1% HP edge (±60 max)
-    - Team contribution: 15 points per mon edge (±90 max)
-    - Note: no explicit turn penalty (keeps values stationary for TT reuse)
+    Fast, bounded 0–100 heuristic with phase-aware weighting and
+    soft-saturation to preserve margins for minimax aggregation.
+
+    - HP edge: smooth (tanh) mapping, steeper in endgame, ≤ ±60
+    - Team edge: dynamic weight (±12..±18 per mon), larger in endgame
+    - Tempo penalty: only in close/neutral positions; decays in endgame
     """
-    # Guard inputs
+    import math  # local import keeps module imports unchanged
+
+    # --- Guard & normalize ----------------------------------------------------
     php = max(0, min(100, int(active_hp_player)))
     ohp = max(0, min(100, int(active_hp_opp)))
+    my_mon = max(0, min(6, int(team_count_player)))
+    opp_mon = max(0, min(6, int(team_count_opp)))
 
-    # HP advantage (scale 0..100)
-    hp_advantage = (php - ohp) * 0.6  # ±60
+    # Phase / endgame factor in [0,1]:
+    # Trigger endgame earlier when one side is low on survivors; also grow slowly with turn.
+    survivors_min = min(my_mon, opp_mon)
+    endgame_factor = max(0.0, min(1.0, (2.0 - min(2.0, float(survivors_min))) / 2.0))
+    endgame_factor = max(endgame_factor, min(1.0, max(0.0, float(turn) - 10.0) / 10.0))
 
-    # Team advantage
-    team_advantage = (int(team_count_player) - int(team_count_opp)) * 15  # ±90
+    # --- HP contribution (±60, smooth) ---------------------------------------
+    hp_diff_pct = php - ohp  # [-100..100]
+    slope = 0.010 + 0.006 * endgame_factor  # ~0.010 opening → ~0.016 endgame
+    hp_contrib = 60.0 * math.tanh(hp_diff_pct * slope)  # in [-60, +60]
 
-    # Base score starts at 50 (neutral). No turn penalty to keep cache stationary.
-    score = 50 + hp_advantage + team_advantage
+    # --- Team contribution (dynamic per-mon weight) --------------------------
+    mon_edge = my_mon - opp_mon  # [-6..+6]
+    w_base, w_end = 12.0, 18.0
+    team_w = w_base + (w_end - w_base) * endgame_factor
+    team_contrib = mon_edge * team_w
 
-    # Clamp to valid range
-    return max(0.0, min(100.0, float(score)))
+    # --- Tempo penalty (only when the position is close) ---------------------
+    adv_mag = abs(hp_contrib) + 0.5 * abs(team_contrib)
+    closeness = max(0.0, 1.0 - adv_mag / 60.0)  # 1 when close, →0 as lead grows
+    raw_turn_pen = max(0.0, float(turn) - 8.0) * 0.35  # starts after turn 8
+    turn_penalty = min(10.0, raw_turn_pen) * closeness * (1.0 - 0.6 * endgame_factor)
+
+    # --- Compose & clamp -----------------------------------------------------
+    score = 50.0 + hp_contrib + team_contrib - turn_penalty
+    score = 50.0 + (score - 50.0) * 0.92  # gentle center squeeze
+    return max(0.0, min(100.0, float(round(score, 2))))
