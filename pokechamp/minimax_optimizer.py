@@ -183,7 +183,7 @@ def mk_ttkey(battle: Battle) -> TTKey:
         try:
             player_boosts = u.boosts if u else {}
             opp_boosts = o.boosts if o else {}
-
+            
             # Only track value-driving boosts (drop accuracy for most gens)
             boosts = (
                 _boost_bucket(player_boosts.get('atk', 0)), 
@@ -199,7 +199,7 @@ def mk_ttkey(battle: Battle) -> TTKey:
             )
         except:
             boosts = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-
+        
         # Tera flags
         try:
             tera_flags = (
@@ -400,9 +400,15 @@ class OptimizedSimNode:
         child_node.parent_node = self
         child_node.parent_action = self.action
 
-        # Step the simulation forward
+        # Step the simulation forward (with micro-profiling)
+        _t0 = time.perf_counter()
         child_node.simulation.step(player_action, opp_action)
-
+        _dt = time.perf_counter() - _t0
+        # Accumulate in optimizer stats for per-move reporting
+        opt = get_minimax_optimizer()
+        opt.stats['sim_step_time'] = opt.stats.get('sim_step_time', 0.0) + float(_dt)
+        opt.stats['sim_steps'] = opt.stats.get('sim_steps', 0) + 1
+        
         # Update relationships
         self.children.append(child_node)
 
@@ -430,6 +436,8 @@ class MinimaxOptimizer:
             'cache_hits': 0,  # Parent-action cache hits
             'pool_reuses': 0,
             'total_time': 0.0,
+            'sim_step_time': 0.0,  # cumulative seconds spent in LocalSim.step()
+            'sim_steps': 0,  # number of LocalSim.step() calls
             'cache_stats': {
                 'state_value_hits': 0,
                 'state_value_misses': 0,
@@ -525,6 +533,10 @@ class MinimaxOptimizer:
 
         return {
             'nodes_created': self.stats['nodes_created'],
+            'sim': {
+                'step_time_s': self.stats.get('sim_step_time', 0.0),
+                'steps': self.stats.get('sim_steps', 0),
+            },
             'pool_stats': {
                 'available': pool_available,
                 'in_use': pool_in_use,
@@ -543,7 +555,7 @@ class MinimaxOptimizer:
             },
             'total_time': self.stats['total_time']
         }
-
+    
     def reset_stats(self):
         """Reset performance statistics."""
         self.stats = {
@@ -551,6 +563,8 @@ class MinimaxOptimizer:
             'cache_hits': 0,
             'pool_reuses': 0,
             'total_time': 0.0,
+            'sim_step_time': 0.0,
+            'sim_steps': 0,
             'cache_stats': {
                 'state_value_hits': 0,
                 'state_value_misses': 0,
@@ -581,7 +595,7 @@ def initialize_minimax_optimization(battle: Battle, **localsim_kwargs):
 @lru_cache(maxsize=500)
 def fast_battle_evaluation(
     active_hp_player: int,
-    active_hp_opp: int,
+    active_hp_opp: int, 
     team_count_player: int,
     team_count_opp: int,
     turn: int,

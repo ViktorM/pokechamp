@@ -198,6 +198,81 @@ class LLMPlayer(Player):
         # Partial trap state tracking (Gen1)
         self._trap_states = {}  # battle_tag -> trap state dict
 
+    # ---- profiling helpers ---------------------------------------------------
+    def _write_algorithm_profile_row(self, battle: Battle, algorithm: str, elapsed_s: float,
+                                     llm_calls: int = 0, json_ok: bool = True, extras: Dict = None):
+        """Generic profiling row for any algorithm."""
+        if not self.log_dir:
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        path = os.path.join(self.log_dir, "algorithm_profile.csv")
+        header = "battle_tag,turn,algorithm,backend,elapsed_s,llm_calls,json_ok,extras\n"
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header)
+
+        row = [
+            getattr(battle, 'battle_tag', ''),
+            getattr(battle, 'turn', 0),
+            algorithm,
+            self.backend,
+            f"{elapsed_s:.3f}",
+            llm_calls,
+            int(json_ok),
+            json.dumps(extras or {})
+        ]
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(",".join(map(str, row)) + "\n")
+
+    def _write_minimax_profile_row(self, battle: Battle, elapsed_s: float, tracer,
+                                   effK: int, leaf_total: int, leaf_llm_scored: int, stats: Dict[str, Any]):
+        """Append a numeric row with timing & cache stats for this move."""
+        if not self.log_dir:
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        path = os.path.join(self.log_dir, "minimax_profile.csv")
+        header = ("battle_tag,turn,algorithm,backend,elapsed_s,effK,"
+                  "init_ms,expansion_ms,cache_ops_ms,llm_calls_ms,batch_eval_ms,action_selection_ms,other_ms,"
+                  "nodes_created,sim_steps,sim_step_ms,tt_hits,tt_misses,q_hits,q_misses,pool_reuse\n")
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header)
+
+        t = tracer.summarize() if tracer else {}
+        init_ms = t.get("initialization", 0.0)
+        expansion_ms = t.get("expansion_loop", 0.0)
+        cache_ms = t.get("cache_ops", 0.0)
+        llm_ms = t.get("llm:leaf_eval", 0.0) + t.get("llm:propose_actions", 0.0) + t.get("llm:score_leaves_batch", 0.0)
+        batch_ms = t.get("batch_eval", 0.0)
+        sel_ms = t.get("action_selection", 0.0)
+        known_ms = init_ms + expansion_ms + cache_ms + llm_ms + batch_ms + sel_ms
+        other_ms = max(0.0, elapsed_s * 1000.0 - known_ms)
+
+        cs = stats.get("cache_stats", {})
+        tt_hits = cs.get("state_value_hits", 0)
+        tt_misses = cs.get("state_value_misses", 0)
+        q_hits = cs.get("parent_action_hits", 0)
+        q_misses = cs.get("parent_action_misses", 0)
+        pool_reuse = stats.get("pool_stats", {}).get("reuse_rate", 0.0)
+        sim_stats = stats.get("sim", {})
+        sim_steps = sim_stats.get("steps", 0)
+        sim_step_ms = (sim_stats.get("step_time_s", 0.0) or 0.0) * 1000.0
+
+        row = [
+            getattr(battle, 'battle_tag', ''),
+            getattr(battle, 'turn', 0),
+            'minimax',  # algorithm
+            self.backend,  # backend/model
+            f"{elapsed_s:.3f}",
+            effK,
+            f"{init_ms:.1f}", f"{expansion_ms:.1f}", f"{cache_ms:.1f}", f"{llm_ms:.1f}",
+            f"{batch_ms:.1f}", f"{sel_ms:.1f}", f"{other_ms:.1f}",
+            stats.get("nodes_created", 0), sim_steps, f"{sim_step_ms:.1f}",
+            tt_hits, tt_misses, q_hits, q_misses, f"{pool_reuse:.3f}",
+        ]
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(",".join(map(str, row)) + "\n")
+
     def _recover_action_from_text(self, raw_text: str, battle: Battle):
         """Attempt to recover a legal action from non-JSON text.
 
@@ -237,7 +312,7 @@ class LLMPlayer(Player):
         
         if len(child_vals) == 1:
             return child_vals[0]
-        
+
         # Sort and take mean of worst two (more stable than eta-mixing)
         sorted_vals = sorted(child_vals)
         worst_two = sorted_vals[:2]
@@ -634,11 +709,35 @@ class LLMPlayer(Player):
         retries = 5
         # Chain-of-thought
         if self.prompt_algo == "io":
-            return self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions)
+            start_time = time.time()
+            from pokechamp.timing_utils import ChromeTracer
+            tracer = ChromeTracer(self.profile, self.log_dir, getattr(battle, 'battle_tag', ''), getattr(battle, 'turn', 0))
+            tracer.begin('io_algorithm')
+            result = self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions, tracer=tracer)
+            tracer.end('io_algorithm')
+            elapsed = time.time() - start_time
+            if self.profile:
+                self._write_algorithm_profile_row(battle, 'io', elapsed, llm_calls=1)
+                trace_path = tracer.dump(algorithm_suffix="io")
+                if trace_path:
+                    print(f"[Profile] IO trace ({len(tracer.events)} events): {trace_path}")
+            return result
 
         # Improved IO with numbered contract and early gate
         elif self.prompt_algo == "io2":
-            return self.io2(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions)
+            start_time = time.time()
+            from pokechamp.timing_utils import ChromeTracer
+            tracer = ChromeTracer(self.profile, self.log_dir, getattr(battle, 'battle_tag', ''), getattr(battle, 'turn', 0))
+            tracer.begin('io2_algorithm')
+            result = self.io2(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim, actions=actions, tracer=tracer)
+            tracer.end('io2_algorithm')
+            elapsed = time.time() - start_time
+            if self.profile:
+                self._write_algorithm_profile_row(battle, 'io2', elapsed, llm_calls=1)
+                trace_path = tracer.dump(algorithm_suffix="io2")
+                if trace_path:
+                    print(f"[Profile] IO2 trace ({len(tracer.events)} events): {trace_path}")
+            return result
 
         # Self-consistency with k = 3
         elif self.prompt_algo == "sc":
@@ -901,7 +1000,7 @@ class LLMPlayer(Player):
             except Exception:
                 pass
 
-    def io(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None):
+    def io(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None, tracer=None):
         next_action = None
         cot_prompt = 'In fewer than 3 sentences, let\'s think step by step:'
         state_prompt_io = state_prompt + state_action_prompt + constraint_prompt_io + cot_prompt
@@ -956,6 +1055,8 @@ class LLMPlayer(Player):
                 return self.choose_max_damage_move(battle)
 
             try:
+                if tracer:
+                    tracer.begin('llm:io_call')
                 llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                             user_prompt=state_prompt_io,
                                             model=self.backend,
@@ -964,6 +1065,8 @@ class LLMPlayer(Player):
                                             # stop=["reason"],
                                             json_format=True,
                                             actions=actions)
+                if tracer:
+                    tracer.end('llm:io_call')
 
                 if DEBUG:
                     print(f"Raw LLM output: {llm_output}")
@@ -1129,7 +1232,7 @@ class LLMPlayer(Player):
         
         return next_action
 
-    def io2(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None):
+    def io2(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None, tracer=None):
         """
         Improved IO with:
         - Numbered action contract {"pick": <int>}
@@ -1142,6 +1245,8 @@ class LLMPlayer(Player):
         retries = min(3, retries)
 
         # Early deterministic fast-path: skip LLM if we clearly win TTK race
+        if tracer:
+            tracer.begin('io2:ko_race_check')
         try:
             dmg_move, our_ttk = self.dmg_calc_move(battle, return_move=True)
             # If dmg_calc_move returns valid move, check if it's a clear win
@@ -1164,8 +1269,13 @@ class LLMPlayer(Player):
                     return result_order
         except Exception:
             pass
+        finally:
+            if tracer:
+                tracer.end('io2:ko_race_check')
 
         # Deterministic, low-token contract: enumerate actions and request {"pick": <int>}
+        if tracer:
+            tracer.begin('io2:build_prompt')
         action_map = []
         idx_lines = []
         for mv in (battle.available_moves or []):
@@ -1195,6 +1305,9 @@ class LLMPlayer(Player):
         constraint_json = '\n\nReturn ONLY JSON: {"pick": <int>, "why":"<=20 tokens"}. Set pick to the index of your chosen action.'
         state_prompt_io = state_prompt + state_action_prompt + indexed_block + tactical_guardrails + cot_prompt + constraint_json
 
+        if tracer:
+            tracer.end('io2:build_prompt')
+
         # Per-move timeout start and accounting
         start_time = time.time()
         near_timeout_threshold = max(0.0, self.move_time_limit_s - 2.0)
@@ -1210,6 +1323,8 @@ class LLMPlayer(Player):
                 return self.choose_max_damage_move(battle)
 
             try:
+                if tracer:
+                    tracer.begin('llm:io2_call')
                 llm_output = self.get_LLM_action(
                     system_prompt=system_prompt,
                     user_prompt=state_prompt_io,
@@ -1220,6 +1335,8 @@ class LLMPlayer(Player):
                     json_format=True,
                     actions=actions
                 )
+                if tracer:
+                    tracer.end('llm:io2_call')
 
                 if DEBUG:
                     print(f"IO2 Raw LLM output: {llm_output}")
@@ -2609,10 +2726,14 @@ Score each action and return the complete ranking array."""
         internal_start = time.time()
 
         # Hierarchical timing with mutual exclusivity
-        from pokechamp.timing_utils import MinimaxTimer
+        from pokechamp.timing_utils import MinimaxTimer, ChromeTracer
         timer = MinimaxTimer()
         timer.start()
         timer.push('initialization')
+        tracer = ChromeTracer(self.profile, self.log_dir, getattr(battle, 'battle_tag', ''), getattr(battle, 'turn', 0))
+        if self.profile and self.logger.level <= logging.DEBUG:
+            print(f"[Tracer] Created for turn {battle.turn}, enabled={tracer.enabled}")
+        tracer.begin('initialization')
 
         root = optimizer.create_optimized_root(battle)
 
@@ -2667,7 +2788,9 @@ Score each action and return the complete ranking array."""
 
             # End initialization, start expansion loop
             timer.pop()  # initialization
+            tracer.end('initialization')
             timer.push('expansion_loop')
+            tracer.begin('expansion_loop')
 
             while len(q) != 0:
                 # If time ran out AND we've expanded at least once, bail to selection
@@ -2809,21 +2932,21 @@ Score each action and return the complete ranking array."""
                             print(f"LLM leaf eval failed, using heuristic: {e}")
 
                     # Cache the state value (post-step) for transposition table
-                    depth_remaining = max(0, self.K - node.depth)
-                    cached = optimizer.cache_state_value(child_tt_key, float(node.hp_diff), depth_remaining)
-                    if not cached and self.logger.level <= logging.DEBUG:
-                        print(f"[TT] Skipped write: deeper entry exists at depth {depth_remaining}")
+                        depth_remaining = max(0, self.K - node.depth)
+                        cached = optimizer.cache_state_value(child_tt_key, float(node.hp_diff), depth_remaining)
+                        if not cached and self.logger.level <= logging.DEBUG:
+                            print(f"[TT] Skipped write: deeper entry exists at depth {depth_remaining}")
 
                     # Also cache by (parent, action, opp) for micro-memoization
-                    if node.parent_node and node.parent_node.simulation:
-                        parent_tt_key = mk_ttkey(node.parent_node.simulation.battle)
-                        p_canonical = canonical_action(node.action, tera=getattr(node.simulation.battle, '_tera_intent', False))
-                        o_canonical = canonical_action(node.action_opp, tera=False)
-                        # Calculate remaining depth for caching
-                        depth_remaining = self.K - node.depth if hasattr(self, 'K') else 0
-                        cached = optimizer.cache_evaluation(parent_tt_key, p_canonical, o_canonical, float(node.hp_diff), depth_remaining)
-                        if not cached and self.logger.level <= logging.DEBUG:
-                            print(f"[Q-cache] Skipped write: deeper entry exists")
+                        if node.parent_node and node.parent_node.simulation:
+                            parent_tt_key = mk_ttkey(node.parent_node.simulation.battle)
+                            p_canonical = canonical_action(node.action, tera=getattr(node.simulation.battle, '_tera_intent', False))
+                            o_canonical = canonical_action(node.action_opp, tera=False)
+                            # Calculate remaining depth for caching
+                            depth_remaining = self.K - node.depth if hasattr(self, 'K') else 0
+                            cached = optimizer.cache_evaluation(parent_tt_key, p_canonical, o_canonical, float(node.hp_diff), depth_remaining)
+                            if not cached and self.logger.level <= logging.DEBUG:
+                                print(f"[Q-cache] Skipped write: deeper entry exists")
 
                     leaf_nodes.append(node)
                     continue
@@ -2839,11 +2962,13 @@ Score each action and return the complete ranking array."""
                             print("ROOT PROPOSAL ACTIVE")
                         try:
                             timer.push('llm_calls')
+                            tracer.begin('llm:propose_actions')
                             seed = self.propose_actions_topk(node.simulation.battle, node.simulation, 
                                                             k_player=2, k_opp=2,
                                                             temperature=self.temp_expand, 
                                                             max_tokens=100)
                             timer.pop()  # llm_calls
+                            tracer.end('llm:propose_actions')
                             # Deserialize player actions
                             for act_dict in seed.get("player", []):
                                 action = self._deserialize_action(node.simulation.battle, act_dict, is_opp=False)
@@ -2893,22 +3018,22 @@ Score each action and return the complete ranking array."""
                             opp_moves = getattr(b.opponent_active_pokemon, 'moves', None)
                             if opp_moves:
                                 action_opp, _ = self.estimate_matchup(node.simulation, b,
-                                                                      b.opponent_active_pokemon,
-                                                                      b.active_pokemon, is_opp=True)
+                                                                     b.opponent_active_pokemon,
+                                                                     b.active_pokemon, is_opp=True)
                         if action_opp:
                             opponent_actions.append(action_opp)
 
-                        # Best switch (heuristic) - higher score = better for opponent
-                        best_score = -np.inf
-                        best_switch = None
-                        for mon in b.opponent_team.values():
-                            if mon.species != b.opponent_active_pokemon.species and not mon.fainted:
-                                score = self._estimate_matchup(mon, b.active_pokemon)
-                                if score > best_score:
-                                    best_score = score
-                                    best_switch = mon
-                        if best_switch and len(opponent_actions) < 2:
-                            opponent_actions.append(self.create_order(best_switch))
+                            # Best switch (heuristic) - higher score = better for opponent
+                            best_score = -np.inf
+                            best_switch = None
+                            for mon in b.opponent_team.values():
+                                if mon.species != b.opponent_active_pokemon.species and not mon.fainted:
+                                    score = self._estimate_matchup(mon, b.active_pokemon)
+                                    if score > best_score:
+                                        best_score = score
+                                        best_switch = mon
+                            if best_switch and len(opponent_actions) < 2:
+                                opponent_actions.append(self.create_order(best_switch))
 
                     # Safety net: if still < 1, add any opponent move/switch available
                     if not opponent_actions and b.opponent_active_pokemon:
@@ -3197,6 +3322,7 @@ Score each action and return the complete ranking array."""
 
             # End expansion loop
             timer.pop()  # expansion_loop
+            tracer.end('expansion_loop')
 
             # Batch evaluate any unevaluated leaf nodes (only if we have time)
             time_remaining = minimax_deadline - time.time()
@@ -3204,11 +3330,14 @@ Score each action and return the complete ranking array."""
 
             # Start batch eval timing
             timer.push('batch_eval')
+            tracer.begin('batch_eval')
             if unevaluated_leaves and time_remaining > 1.5:
                 # Score all leaves in one LLM call (score_leaves_batch builds compact representation)
                 timer.push('llm_calls')
+                tracer.begin('llm:score_leaves_batch')
                 scores = self.score_leaves_batch(unevaluated_leaves, temperature=self.temp_expand or 0.0, max_tokens=min(180, self.mt_expand or 180))
                 timer.pop()  # llm_calls
+                tracer.end('llm:score_leaves_batch')
 
                 # Apply scores and cache
                 for node, score in zip(unevaluated_leaves, scores):
@@ -3291,6 +3420,7 @@ Score each action and return the complete ranking array."""
 
             # End batch eval
             timer.pop()  # batch_eval
+            tracer.end('batch_eval')
 
             # Ensure root children have values before selection (fill with richer heuristic if missing)
             if root.children:
@@ -3464,8 +3594,10 @@ Score each action and return the complete ranking array."""
 
             # Time action selection
             timer.push('action_selection')
+            tracer.begin('action_selection')
             action, _, action_opp = get_tree_action(root)
             timer.pop()  # action_selection
+            tracer.end('action_selection')
 
             # Log performance stats with instrumentation
             end_time = time.time()
@@ -3493,6 +3625,11 @@ Score each action and return the complete ranking array."""
             # Print timing breakdown if profiling is enabled
             if self.profile:
                 timer.report()
+                # Persist numeric row + trace
+                self._write_minimax_profile_row(battle, end_time - internal_start, tracer, effective_K, leaf_total, leaf_llm_scored, stats)
+                trace_path = tracer.dump(algorithm_suffix="minimax")
+                if trace_path:
+                    print(f"[Profile] Minimax trace ({len(tracer.events)} events): {trace_path}")
 
             # Record successful minimax completion
             progress_score = self._record_progress(battle)
