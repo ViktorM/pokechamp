@@ -451,6 +451,59 @@ class LLMPlayer(Player):
 
         return None
 
+    def parse_new(self, s: str, battle: Battle, sim=None) -> Optional[BattleOrder]:
+        """
+        Tolerant parser for ToT stage-2 output.
+        Accepts any of the following JSON shapes and returns a legal BattleOrder:
+          - {"decision":{"action":"move","target":"<move_id>", ["tera":bool, "dmax":bool]}}
+          - {"decision":{"move":"<move_id>"}} or {"decision":{"switch":"<species>"}}
+          - {"move":"<move_id>"} or {"switch":"<species>"}
+        Falls back to text recovery and finally to a safe default.
+        """
+        obj = self._extract_json_obj(s) or {}
+
+        # Prefer a nested "decision" object if present
+        decision = obj.get("decision", obj) if isinstance(obj, dict) else {}
+        choice: dict = {}
+
+        if isinstance(decision, dict):
+            # Unified ("action" + "target")
+            act = (decision.get("action") or "").strip().lower()
+            tgt = decision.get("target")
+            if act in ("move", "switch") and isinstance(tgt, str) and tgt.strip():
+                choice = {act: tgt}
+                # preserve structured flags if present
+                for flag in ("tera", "dmax", "dynamax", "terastallize"):
+                    if flag in decision:
+                        choice[flag] = decision[flag]
+            # Alternate shapes
+            if not choice and "move" in decision:
+                choice = {"move": decision.get("move")}
+            if not choice and "switch" in decision:
+                choice = {"switch": decision.get("switch")}
+
+        # Top-level fallback
+        if not choice and isinstance(obj, dict):
+            if "move" in obj:
+                choice = {"move": obj.get("move")}
+            elif "switch" in obj:
+                choice = {"switch": obj.get("switch")}
+            for flag in ("tera", "dmax", "dynamax", "terastallize"):
+                if flag in obj:
+                    choice[flag] = obj[flag]
+
+        # Try to legalize the structured choice
+        if choice:
+            action = self.legalize_choice(battle, choice)
+            if action is not None:
+                return action
+
+        # Fallbacks: recover from free text, then safe default
+        recovered = self._recover_action_from_text(s or "", battle)
+        if recovered is not None:
+            return recovered
+        return self._safe_default(battle)
+
     def _safe_default(self, battle: Battle) -> BattleOrder:
         """
         Robust fallback when no action can be determined.
