@@ -4,6 +4,7 @@ import os
 import importlib
 import inspect
 
+
 prompt_algos = [
     "io", 
     "io2",    # Improved IO with numbered contract and early gate
@@ -11,6 +12,7 @@ prompt_algos = [
     "cot", 
     "tot", 
     "minimax", 
+    "minimax_original",  # Original minimax implementation
     "heuristic", 
     'max_power',
     'one_step',
@@ -44,8 +46,29 @@ available_bots = get_available_bots()
 # Combine built-in bots with custom bots
 bot_choices = ['pokechamp', 'pokellmon', 'one_step', 'abyssal', 'max_power', 'random'] + available_bots
 
-PNUMBER1 = str(np.random.randint(0,10000))
-print(PNUMBER1)
-seed = 100
-random.seed(seed)
-np.random.seed(seed)
+# Generate a random number for battle tags (will be regenerated after seed is set)
+PNUMBER1 = None
+
+def get_battle_number():
+    """Get a random battle number, regenerating if needed after seed is set."""
+    global PNUMBER1
+    if PNUMBER1 is None:
+        PNUMBER1 = str(np.random.randint(0,10000))
+    return PNUMBER1
+
+def set_random_seed(seed=None):
+    """Set random seed for reproducibility. If seed is None, use true randomness."""
+    global PNUMBER1
+    if seed is not None:
+        print(f"Setting random seed: {seed}")
+        random.seed(seed)
+        np.random.seed(seed)
+    else:
+        print("Using true randomness (no seed set)")
+    # Regenerate battle number with new seed
+    PNUMBER1 = str(np.random.randint(0,10000))
+    print(f"Battle number: {PNUMBER1}")
+
+# Default behavior - no seed (true randomness)
+# To set seed, call set_random_seed(seed) from your script
+# Note: Removed automatic call to avoid misleading message at import time

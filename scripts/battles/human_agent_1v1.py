@@ -1,3 +1,8 @@
+"""
+Script for running AI agents on the ladder.
+Note: Despite the name, this doesn't set up human vs AI battles.
+It creates an AI player that plays ladder games against random opponents.
+"""
 import asyncio
 from tqdm import tqdm
 import argparse
@@ -37,14 +42,22 @@ parser.add_argument("--backend", type=str, default="openai/gpt-4o", choices=[
 parser.add_argument("--log_dir", type=str, default="./battle_log/ladder")
 parser.add_argument("--device", type=int, default=0)
 parser.add_argument("--name", type=str, default='pokechamp', choices=['pokechamp', 'pokellmon', 'one_step', 'abyssal', 'max_power', 'random'])
+parser.add_argument("--N", type=int, default=5, help="Number of battles to play")
 parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
                     help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
+parser.add_argument("--seed", type=int, default=None,
+                    help="Random seed for reproducibility. If not specified, uses true randomness.")
+parser.add_argument("--max_tokens", type=int, default=300, help="Default max tokens")
+parser.add_argument("--K", type=int, default=None, help="For sc: samples; for minimax: search depth; for ToT: number of options")
+parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
+parser.add_argument("--verbose", action="store_true", help="Show detailed turn-by-turn battle information")
+parser.add_argument("--profile", action="store_true", help="Show timing breakdown for minimax (without verbose debug output)")
 
 # Two-tier temperature/token configuration (optional overrides)
 parser.add_argument("--temp_action", type=float, default=None,
-                    help="Temperature for structured JSON decisions (default: 0.0)")
+                    help="Temperature for structured JSON decisions (default: 0.3)")
 parser.add_argument("--mt_action", type=int, default=None,
-                    help="Max tokens for JSON decisions (default: 16)")
+                    help="Max tokens for JSON decisions (default: 120)")
 parser.add_argument("--temp_expand", type=float, default=None,
                     help="Temperature for reasoning/expansion (default: uses --temperature)")
 parser.add_argument("--mt_expand", type=int, default=None,
@@ -53,22 +66,38 @@ parser.add_argument("--mt_expand", type=int, default=None,
 args = parser.parse_args()
 
 async def main():
+    import logging
     from pokechamp.data_cache import set_elo_tier
+    from common import set_random_seed
+    
+    # Set random seed if provided
+    set_random_seed(args.seed)
     
     # Set Elo tier for move sets
     set_elo_tier(args.elo_tier)
+    
+    # Set logging level based on verbose flag
+    log_level = logging.DEBUG if args.verbose else logging.WARNING
 
     opponent = get_llm_player(args, 
                             args.backend, 
                             args.prompt_algo, 
                             args.name, 
-                            PNUMBER1=PNUMBER1,
-                            battle_format=args.battle_format)
+                            PNUMBER1=get_battle_number(),
+                            battle_format=args.battle_format,
+                            log_level=log_level)
+    
+    # Apply configuration parameters
+    opponent.max_tokens = args.max_tokens
+    if args.K is not None:
+        opponent.K = args.K
+    opponent.move_time_limit_s = args.move_time_limit
+    
     if not 'random' in args.battle_format:
         opponent.update_team(load_random_team())                      
     
-    # Playing 5 games on local
-    for i in tqdm(range(5)):
+    # Playing N games on ladder
+    for i in tqdm(range(args.N)):
         await opponent.ladder(1)
         if not 'random' in args.battle_format:
             opponent.update_team(load_random_team())

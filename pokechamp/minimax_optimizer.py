@@ -453,6 +453,7 @@ class MinimaxOptimizer:
 
     def create_optimized_root(self, battle: Battle) -> OptimizedSimNode:
         """Create an optimized root node for minimax search."""
+        # Start at depth=0 so K matches documented behavior (K=3 means 3 moves lookahead)
         root = OptimizedSimNode(battle, self.sim_pool, depth=0)
         self.stats['nodes_created'] += 1
         return root

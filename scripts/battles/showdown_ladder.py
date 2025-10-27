@@ -13,7 +13,7 @@ from common import *
 from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_random_team
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--temperature", type=float, default=0.5)
+parser.add_argument("--temperature", type=float, default=0.3)
 parser.add_argument("--reasoning_effort", type=str, default="medium", choices=["low", "medium", "high"],
                     help="Reasoning effort for gpt-5/o4-mini model (low=faster, high=better quality)")
 parser.add_argument("--prompt_algo", default="minimax", choices=prompt_algos)
@@ -53,7 +53,7 @@ parser.add_argument("--USERNAME", type=str, default='')
 parser.add_argument("--PASSWORD", type=str, default='')
 parser.add_argument("--N", type=int, default=1)
 parser.add_argument("--max_tokens", type=int, default=300)
-parser.add_argument("--K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth")
+parser.add_argument("--K", type=int, default=None, help="For sc: samples; for minimax: search depth; for ToT: number of options")
 parser.add_argument("--team_pool", type=str, default="competitive", choices=["competitive","modern_replays","pokeagent_modern_replays"],
                     help="Choose team source pool for the ladder")
 parser.add_argument("--min_elo", type=int, default=None, help="Filter teams by minimum Elo (if available in filenames)")
@@ -61,12 +61,14 @@ parser.add_argument("--max_elo", type=int, default=None, help="Filter teams by m
 parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
 parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
                     help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
+parser.add_argument("--seed", type=int, default=None,
+                    help="Random seed for reproducibility. If not specified, uses true randomness.")
 
 # Two-tier temperature/token configuration (optional overrides)
 parser.add_argument("--temp_action", type=float, default=None,
                     help="Temperature for structured JSON decisions (default: 0.0)")
 parser.add_argument("--mt_action", type=int, default=None,
-                    help="Max tokens for JSON decisions (default: 16)")
+                    help="Max tokens for JSON decisions (default: 120)")
 parser.add_argument("--temp_expand", type=float, default=None,
                     help="Temperature for reasoning/expansion (default: uses --temperature)")
 parser.add_argument("--mt_expand", type=int, default=None,
@@ -76,6 +78,10 @@ args = parser.parse_args()
     
 async def main():
     from pokechamp.data_cache import set_elo_tier
+    from common import set_random_seed
+    
+    # Set random seed if provided
+    set_random_seed(args.seed)
     
     # Set Elo tier for move sets (use sharper priors for top ladder)
     set_elo_tier(args.elo_tier)
@@ -90,22 +96,11 @@ async def main():
                             server=args.server,
                             USERNAME=args.USERNAME, 
                             PASSWORD=args.PASSWORD)
-    # Propagate max_tokens to player
-    try:
-        player.max_tokens = int(max(1, args.max_tokens))
-    except Exception:
-        pass
-    # Optionally set K (samples or depth)
-    try:
-        if args.K is not None:
-            player.K = int(max(1, args.K))
-    except Exception:
-        pass
-    # Set move time limit
-    try:
-        player.move_time_limit_s = float(max(1.0, args.move_time_limit))
-    except Exception:
-        pass
+    # Propagate configuration to player
+    player.max_tokens = args.max_tokens
+    if args.K is not None:
+        player.K = args.K
+    player.move_time_limit_s = args.move_time_limit
     
     teamloader = get_metamon_teams(args.battle_format, args.team_pool, min_elo=args.min_elo, max_elo=args.max_elo)
     
@@ -127,7 +122,7 @@ async def main():
             wins += 1
         if not 'random' in args.battle_format:
             player.update_team(teamloader.yield_team())
-        sleep(30)
+        sleep(10)
         pbar.set_description(f"{wins/(i+1)*100:.2f}%")
         pbar.update(1)
         print(winner)

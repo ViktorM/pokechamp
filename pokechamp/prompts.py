@@ -325,7 +325,7 @@ def get_move_prompt(mon: Pokemon,
                     ):
     move_prompt = ''
     moves = sim.get_opponent_current_moves(mon=mon, is_player=is_player)
-    
+
     def call_dmg_calc(mon: Pokemon, mon_opp: Pokemon, move: Move):
         move_prompt = ''
         t = 0
@@ -337,9 +337,9 @@ def get_move_prompt(mon: Pokemon,
         else:
             t = get_number_turns_faint(mon, move, mon_opp, sim, boosts1=mon._boosts.copy(), boosts2=mon_opp.boosts.copy())
             move_prompt += f'{move_id}: {t} turns to KO opponent\'s pokemon\n'
-            
+
         return move_prompt, t
-    
+
     for move_id in moves:
         # @TODO: fix nothing coming up
         if 'nothing' == move_id:
@@ -352,7 +352,7 @@ def get_move_prompt(mon: Pokemon,
             if move.category == MoveCategory.STATUS:
                 move_prompt += f'{move_id}: inf turn to KO opponent\'s pokemon. This will fully protect your pokemon from all damage.'
                 continue
-            
+
         prompt_new, _ = call_dmg_calc(mon, mon_opp, move)
         move_prompt += prompt_new
 
@@ -364,7 +364,7 @@ def get_move_prompt(mon: Pokemon,
         #else:
         #    t = get_number_turns_faint(mon, move, mon_opp, sim, boosts1=mon._boosts.copy(), boosts2=mon_opp.boosts.copy())
         #    move_prompt += f'{move_id}: {t} turns to KO opponent\'s pokemon\n'
-    
+
     if sim.battle._data.gen == 8 and sim.battle.can_dynamax:
         # give data about if bot were to dynamax
         move_prompt += f"If {mon.species} uses \'dynamax\':\n"
@@ -374,7 +374,7 @@ def get_move_prompt(mon: Pokemon,
             move = Move(move_id, gen=sim.gen.gen).dynamaxed
             prompt_new, _ = call_dmg_calc(mon, mon_opp, move)
             move_prompt += prompt_new
-                
+
     if sim.battle._data.gen == 9 and sim.battle.can_tera:
 
         if not mon_opp.terastallized:
@@ -422,7 +422,7 @@ def get_move_prompt(mon: Pokemon,
                 prompt_new, _ = call_dmg_calc(mon, mon_opp, move)
                 move_prompt += prompt_new
             mon.unterastallize()
-            
+
     return move_prompt
 
 def get_move_opp_prompt(mon: Pokemon,
@@ -445,7 +445,6 @@ def get_move_opp_prompt(mon: Pokemon,
             move_prompt += f'{move_id}: {t} turns to KO your pokemon\n'
             
         return move_prompt
-    
 
     for move_id in moves:
         # @TODO: fix nothing coming up
@@ -488,7 +487,7 @@ def get_move_opp_prompt(mon: Pokemon,
             # else:
             #     t = 1+get_number_turns_faint(mon_opp, move, mon, sim, boosts1=mon_opp._boosts.copy(), boosts2=mon.boosts.copy())
             #     move_prompt += f'{move_id}: {t} turns to KO your pokemon\n'
-        
+
     if sim.battle._data.gen == 9 and sim.battle.opponent_can_tera and mon_opp.active and mon.active:
         if not mon.terastallized:
             # untera'd opp vs tera'd mon
@@ -543,7 +542,6 @@ def get_speed_prompt(mon: Pokemon,
     else:
         return f'{mon_opp.species} outspeeds {mon.species}\n'
 
-
 def estimate_matchup(sim: LocalSim, battle: Battle, mon: Pokemon, mon_opp: Pokemon, is_opp: bool=False):
         hp_remaining = []
         hps = []
@@ -568,7 +566,7 @@ def estimate_matchup(sim: LocalSim, battle: Battle, mon: Pokemon, mon_opp: Pokem
         best_move = moves[hp_best_index]
         best_move_turns = hp_remaining[hp_best_index]
         return Move(best_move, gen=sim.gen.gen), best_move_turns, hps
-    
+
 def get_micro_strat(sim: LocalSim,
                     battle: Battle
                     ) -> str:
@@ -684,7 +682,6 @@ def get_gimmick_motivation(sim: LocalSim, battle: Battle):
 
     gimmick_motiviation_prompt = ''
 
-
     if gen == 8:
         # if battle._dynamax_intent and not battle.active_pokemon.is_dynamaxed:
         #     gimmick_motiviation_prompt += 'You are about to \'dynamax\' this turn, you should choose a move with this in mind.\n'
@@ -719,9 +716,8 @@ def get_gimmick_motivation(sim: LocalSim, battle: Battle):
             # gimmick_motiviation_prompt += "You are able to use [\'terastallize\'] this turn as well. It is recommended you choose \'terastallize\' this turn as your move over the other moves listed.\n"
             gimmick_motiviation_prompt += "It is recommended you choose to \'terastallize\' this turn paired with a move from your available moves.\n"
 
-
     return gimmick_motiviation_prompt
-    
+
 def prompt_translate(sim: LocalSim, 
                     battle: Battle,
                     return_actions=False

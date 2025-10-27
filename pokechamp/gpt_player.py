@@ -159,7 +159,7 @@ class GPTPlayer():
                     request_params["response_format"] = {"type": "json_object"}
                 if self.service_tier:
                     request_params["service_tier"] = self.service_tier
-                # Compatibility logging removed (too noisy)
+
                 response = client.chat.completions.create(**request_params)
         except RateLimitError:
             # sleep 5 seconds and try again
@@ -239,7 +239,7 @@ class GPTPlayer():
                         },
                         "strict": True
                     }
-                # Compatibility logging removed (too noisy)
+
                 try:
                     r = client.responses.create(**params)
                 except TypeError as te:
@@ -281,7 +281,7 @@ class GPTPlayer():
                     params["response_format"] = {"type": "json_object"}
                 if self.service_tier:
                     params["service_tier"] = self.service_tier
-                # Compatibility logging removed (too noisy)
+
                 response = client.chat.completions.create(**params)
                 message = response.choices[0].message.content
 

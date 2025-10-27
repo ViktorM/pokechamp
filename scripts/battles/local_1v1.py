@@ -75,16 +75,18 @@ parser.add_argument("--verbose", action="store_true", help="Show detailed turn-b
 parser.add_argument("--profile", action="store_true", help="Show timing breakdown for minimax (without verbose debug output)")
 parser.add_argument("--max_tokens", type=int, default=300, help="Default max tokens for both players")
 parser.add_argument("--move_time_limit", type=float, default=8.0, help="Time limit per move in seconds (default: 8.0)")
-parser.add_argument("--player_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (player)")
-parser.add_argument("--opponent_K", type=int, default=None, help="For sc: samples; for minimax/TOT: search breadth/depth (opponent)")
+parser.add_argument("--player_K", type=int, default=None, help="For sc: samples; for minimax: search depth; for ToT: number of options (player)")
+parser.add_argument("--opponent_K", type=int, default=None, help="For sc: samples; for minimax: search depth; for ToT: number of options (opponent)")
 parser.add_argument("--elo_tier", type=int, default=1825, choices=[0, 1000, 1500, 1825],
                     help="Elo tier for move sets (default: 1825 = top ladder, sharper priors)")
+parser.add_argument("--seed", type=int, default=None,
+                    help="Random seed for reproducibility. If not specified, uses true randomness.")
 
 # Two-tier temperature/token configuration (shared, optional overrides)
 parser.add_argument("--temp_action", type=float, default=None,
                     help="Temperature for structured JSON decisions (default: 0.0)")
 parser.add_argument("--mt_action", type=int, default=None,
-                    help="Max tokens for JSON decisions (default: 16)")
+                    help="Max tokens for JSON decisions (default: 120)")
 parser.add_argument("--temp_expand", type=float, default=None,
                     help="Temperature for reasoning/expansion (default: uses --temperature)")
 parser.add_argument("--mt_expand", type=int, default=None,
@@ -95,6 +97,10 @@ args = parser.parse_args()
 async def main():
     import logging
     from pokechamp.data_cache import set_elo_tier
+    from common import set_random_seed
+    
+    # Set random seed if provided
+    set_random_seed(args.seed)
     
     # Set Elo tier for move sets
     set_elo_tier(args.elo_tier)
@@ -111,33 +117,27 @@ async def main():
                             args.player_prompt_algo, 
                             args.player_name, 
                             device=args.player_device,
-                            PNUMBER1=PNUMBER1 + timestamp,  # for name uniqueness locally
+                            PNUMBER1=get_battle_number() + timestamp,  # for name uniqueness locally
                             battle_format=args.battle_format,
                             log_level=log_level)
     # Apply local tuning knobs
-    try:
-        player.max_tokens = int(max(1, args.max_tokens))
-        if args.player_K is not None:
-            player.K = int(max(1, args.player_K))
-        player.move_time_limit_s = float(max(1.0, args.move_time_limit))
-    except Exception:
-        pass
+    player.max_tokens = args.max_tokens
+    if args.player_K is not None:
+        player.K = args.player_K
+    player.move_time_limit_s = args.move_time_limit
     
     opponent = get_llm_player(args, 
                             args.opponent_backend, 
                             args.opponent_prompt_algo, 
                             args.opponent_name, 
                             device=args.opponent_device,
-                            PNUMBER1=PNUMBER1 + str(int(timestamp) + 1),  # for name uniqueness locally
+                            PNUMBER1=get_battle_number() + str(int(timestamp) + 1),  # for name uniqueness locally
                             battle_format=args.battle_format,
                             log_level=log_level)
-    try:
-        opponent.max_tokens = int(max(1, args.max_tokens))
-        if args.opponent_K is not None:
-            opponent.K = int(max(1, args.opponent_K))
-        opponent.move_time_limit_s = float(max(1.0, args.move_time_limit))
-    except Exception:
-        pass
+    opponent.max_tokens = args.max_tokens
+    if args.opponent_K is not None:
+        opponent.K = args.opponent_K
+    opponent.move_time_limit_s = args.move_time_limit
 
     # Use old teamloader for player, modern for opponent
     player_teamloader = get_metamon_teams(args.battle_format, "competitive")
